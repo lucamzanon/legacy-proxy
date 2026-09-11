@@ -9,6 +9,7 @@ export class GmailApi {
   private refreshToken?: string;
   private nextSlot = 0;
   private active = 0;
+  private blockedUntil = 0;
   private waiting: (() => void)[] = [];
   constructor(private email: string, private connection: GmailConnection, private store: GmailStore) {}
   async get<T>(resource: string, cost: number, params: Record<string, string> = {}): Promise<T> {
@@ -16,9 +17,6 @@ export class GmailApi {
     if (this.active >= 4) await new Promise<void>((resolve) => this.waiting.push(resolve));
     else this.active++;
     try {
-      const slot = Math.max(Date.now(), this.nextSlot);
-      this.nextSlot = slot + cost * 1000 / 80; // 4,800 units/min, below the 6,000 default quota.
-      if (slot > Date.now()) await new Promise((resolve) => setTimeout(resolve, slot - Date.now()));
       const saved = await this.store.load(this.email);
       if (!saved) throw new JmapError("accountNotFound");
       if (!this.client || this.refreshToken !== saved.credentials.refreshToken) {
@@ -36,16 +34,44 @@ export class GmailApi {
       }, this.refreshToken);
       const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/${resource}`);
       for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
-      const { data } = await client.request<T>({ url: url.href, timeout: 15_000, retry: false });
-      return data;
+      for (let attempt = 0; ; attempt++) {
+        const slot = Math.max(Date.now(), this.nextSlot);
+        this.nextSlot = slot + cost * 1000 / 80; // 4,800 units/min, including retries.
+        if (slot > Date.now()) await new Promise((resolve) => setTimeout(resolve, slot - Date.now()));
+        // A sibling request can extend the cooldown while this one is waiting.
+        while (this.blockedUntil > Date.now()) {
+          const wait = this.blockedUntil - Date.now();
+          if (wait > 10_000) throw new JmapError("serverUnavailable", "Google rate limit; retry later");
+          await new Promise((resolve) => setTimeout(resolve, wait));
+        }
+        try {
+          const { data } = await client.request<T>({ url: url.href, timeout: 15_000, retry: false });
+          return data;
+        } catch (error) {
+          const response = (error as { response?: { status?: number; data?: { error?: { errors?: { reason?: string }[] } };
+            headers?: { get?: (key: string) => string | null } } }).response;
+          const status = response?.status;
+          const reason = response?.data?.error?.errors?.[0]?.reason;
+          const rateLimited = status === 429 || status === 403 &&
+            (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded");
+          const temporary = rateLimited || status !== undefined && [500,502,503,504].includes(status);
+          if (!temporary) {
+            if (status === 403) throw new JmapError("serverUnavailable", reason === "dailyLimitExceeded"
+              ? "Google daily quota exceeded" : "Google denied access; verify account permissions");
+            throw error;
+          }
+          const retryAfter = response?.headers?.get?.("retry-after");
+          const requestedDelay = retryAfter ? (/^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now()) : 0;
+          const delay = Math.max(1000 * 2 ** attempt, Number.isFinite(requestedDelay) ? requestedDelay : 0);
+          this.blockedUntil = Math.max(this.blockedUntil, Date.now() + delay);
+          if (attempt >= 2 || delay > 10_000) throw new JmapError("serverUnavailable",
+            rateLimited ? "Google rate limit; retry later" : "Google temporarily unavailable; retry later");
+        }
+      }
     } catch (error) {
       if (error instanceof JmapError) throw error;
       const status = (error as { response?: { status?: number } }).response?.status;
       if (status === 404) throw new JmapError("notFound");
-      if (status === 429 || status === 403) {
-        this.nextSlot = Math.max(this.nextSlot, Date.now() + 5000);
-        throw new JmapError("serverUnavailable", "Google rate limit or permission error; retry later");
-      }
       // Library errors may contain Authorization headers: never pass them to the dispatcher.
       throw new JmapError("serverUnavailable", "Gmail request failed; reconnect if authorization expired");
     } finally {

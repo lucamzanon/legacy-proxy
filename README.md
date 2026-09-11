@@ -315,7 +315,10 @@ npm run gmail:check -- tester@gmail.com
 ```
 
 This refreshes the profile/label snapshot and prints only counts. No background
-mail sync or quota retry loop is enabled yet. Token refresh is coalesced within
+mail sync is enabled yet. JMAP reads retry temporary Google rate/server errors
+at most twice with exponential backoff and a shared account cooldown. Long
+Retry-After delays return an error immediately; permanent permission errors are
+not retried. The diagnostic snapshot command itself does not retry. Token refresh is coalesced within
 one process; run a single writer per data directory during this experimental
 stage. Google requests have timeouts, and failed checks retain the last snapshot.
 

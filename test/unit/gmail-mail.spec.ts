@@ -57,3 +57,51 @@ it("sanitizes Google errors before they reach JMAP or logs",async()=>{const {sto
 it("opens a large folder without scanning every page",async()=>{const {mail,store,get}=setup();store.cache(email,"profile",{...profile,messagesTotal:100000},60000);const result=await mail.methods()["Email/query"]!({accountId:mail.accountId,limit:2,calculateTotal:true});expect(result).toMatchObject({ids:["m_a","m_b"],total:100000});expect(get.mock.calls.filter(c=>c[0]==="messages")).toHaveLength(1);});
 
 it("treats unmapped client keywords as absent",()=>{expect(gmailFilter({hasKeyword:"label/custom.tag"},labels)).toBe("in:anywhere -in:anywhere");expect(gmailFilter({notKeyword:"$pinned"},labels)).toBe("-(in:anywhere -in:anywhere)");});
+it("de-duplicates overlapping native folder pages before calculating offsets",async()=>{
+ const {mail,get}=setup();
+ const result=await mail.methods()["Email/query"]!({accountId:mail.accountId,limit:3,calculateTotal:true});
+ expect(result).toMatchObject({ids:["m_a","m_b","m_c"],total:3});
+ expect(get.mock.calls.filter(c=>c[0]==="messages")).toHaveLength(2);
+});
+it("returns malformed thread IDs in notFound without contacting Google",async()=>{
+ const {mail,get}=setup();const result=await mail.methods()["Thread/get"]!({accountId:mail.accountId,ids:["bad","t_../private"]});
+ expect(result).toMatchObject({list:[],notFound:["bad","t_../private"]});
+ expect(get.mock.calls.some(c=>c[0].startsWith("threads/"))).toBe(false);
+});
+it("treats malformed blob IDs as missing downloads",async()=>{
+ const {mail,get}=setup();await expect(mail.download("gb_invalid")).rejects.toMatchObject({type:"notFound"});expect(get).not.toHaveBeenCalled();
+});
+it.each([429,503,"rateLimitExceeded"])("retries temporary Google failure %s, preserving secret redaction",async(kind)=>{
+ const {store}=setup();await store.save(email,{mech:"XOAUTH2",username:email,refreshToken:"fake"},{profile,labels});
+ vi.useFakeTimers();const request=vi.fn().mockRejectedValueOnce({message:"SECRET",response:{status:typeof kind==="number"?kind:403,data:{error:{errors:[{reason:kind}]}},headers:new Headers()}}).mockResolvedValue({data:profile});
+ const client:any={credentials:{},setCredentials(c:any){this.credentials=c;},getAccessToken:async()=>{},request};
+ const promise=new GmailApi(email,{createClient:()=>client} as any,store).get("profile",1);
+ await vi.runAllTimersAsync();expect(await promise).toEqual(profile);expect(request).toHaveBeenCalledTimes(2);
+});
+it("does not retry permanent Google permission errors",async()=>{
+ const {store}=setup();await store.save(email,{mech:"XOAUTH2",username:email,refreshToken:"fake"},{profile,labels});
+ const request=vi.fn().mockRejectedValue({message:"SECRET",response:{status:403,data:{error:{errors:[{reason:"domainPolicy"}]}}}});
+ const client:any={credentials:{},setCredentials(c:any){this.credentials=c;},getAccessToken:async()=>{},request};
+ await expect(new GmailApi(email,{createClient:()=>client} as any,store).get("profile",1)).rejects.toMatchObject({message:"Google denied access; verify account permissions"});expect(request).toHaveBeenCalledTimes(1);
+});
+it("bounds retries and honors long Retry-After without holding a request open",async()=>{
+ const {store}=setup();await store.save(email,{mech:"XOAUTH2",username:email,refreshToken:"fake"},{profile,labels});
+ const request=vi.fn().mockRejectedValue({response:{status:429,headers:new Headers({"retry-after":"60"})}});
+ const client:any={credentials:{},setCredentials(c:any){this.credentials=c;},getAccessToken:async()=>{},request};const api=new GmailApi(email,{createClient:()=>client} as any,store);
+ await expect(api.get("profile",1)).rejects.toMatchObject({message:"Google rate limit; retry later"});
+ await expect(api.get("profile",1)).rejects.toMatchObject({type:"serverUnavailable"});expect(request).toHaveBeenCalledTimes(1);
+});
+it("stops after three attempts on a persistent Google outage",async()=>{
+ const {store}=setup();await store.save(email,{mech:"XOAUTH2",username:email,refreshToken:"fake"},{profile,labels});vi.useFakeTimers();
+ const request=vi.fn().mockRejectedValue({message:"SECRET",response:{status:503}});
+ const client:any={credentials:{},setCredentials(c:any){this.credentials=c;},getAccessToken:async()=>{},request};
+ const result=expect(new GmailApi(email,{createClient:()=>client} as any,store).get("profile",1)).rejects.toMatchObject({message:"Google temporarily unavailable; retry later"});
+ await vi.runAllTimersAsync();await result;expect(request).toHaveBeenCalledTimes(3);
+});
+it("applies a rate-limit cooldown to requests already waiting for their slot",async()=>{
+ const {store}=setup();await store.save(email,{mech:"XOAUTH2",username:email,refreshToken:"fake"},{profile,labels});vi.useFakeTimers();
+ const times:number[]=[];const request=vi.fn(async()=>{times.push(Date.now());if(times.length===1)throw {response:{status:429}};return {data:profile};});
+ const client:any={credentials:{},setCredentials(c:any){this.credentials=c;},getAccessToken:async()=>{},request};const api=new GmailApi(email,{createClient:()=>client} as any,store);
+ const results=Promise.all([api.get("profile",1),api.get("profile",1)]);
+ await vi.runAllTimersAsync();expect(await results).toEqual([profile,profile]);expect(times[1]!-times[0]!).toBeGreaterThanOrEqual(1000);
+});

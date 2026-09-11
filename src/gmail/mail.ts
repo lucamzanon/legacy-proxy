@@ -138,7 +138,7 @@ export class GmailMail {
       if (total !== undefined) {
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
-        const refs: { id: string; threadId: string }[] = [];
+        const refs = new Map<string, { id: string; threadId: string }>();
         let token = "";
         const tokens = new Set<string>();
         if (count && (pos as number) < total) do {
@@ -146,14 +146,14 @@ export class GmailMail {
           const page = await this.cached<{ messages?: { id: string; threadId: string }[]; nextPageToken?: string }>(
             `page:${state}:${hash(q)}:${hash(cursor)}`, 30 * 60_000,
             () => this.api.get("messages", 5, { q, includeSpamTrash: "true", maxResults: "500", ...(cursor ? { pageToken: cursor } : {}) }));
-          refs.push(...page.messages ?? []);
+          for (const reference of page.messages ?? []) refs.set(reference.id, reference);
           token = page.nextPageToken ?? "";
           if (token && tokens.has(token)) throw new JmapError("serverUnavailable", "Gmail repeated a pagination cursor");
           tokens.add(token);
           if (tokens.size > 2000) throw new JmapError("serverUnavailable", "Query exceeds the experimental index limit");
-        } while (token && refs.length < wanted);
+        } while (token && refs.size < wanted);
         return { accountId: this.accountId, queryState: hash([state,q]), canCalculateChanges: false,
-          position: pos, ids: refs.slice(pos as number,(pos as number)+count).map((r)=>"m_"+r.id),
+          position: pos, ids: [...refs.values()].slice(pos as number,(pos as number)+count).map((r)=>"m_"+r.id),
           ...(args.calculateTotal === true ? { total } : {}), ...((limit as number)>MAX_QUERY ? {limit:MAX_QUERY} : {}) };
       }
     }
@@ -248,7 +248,7 @@ export class GmailMail {
             for(const message of thread.messages??[])this.store.cache(this.email,`message:${state}:${message.id}`,message,30*60_000);
             const messages=[...(thread.messages??[])].sort((a,b)=>Number(a.internalDate)-Number(b.internalDate));
             list.push(this.project({id, emailIds:messages.map((m)=>"m_"+m.id)},properties));
-          } catch(error) { if(error instanceof JmapError && error.type==="notFound")notFound.push(id);else throw error; }
+          } catch(error) { if(error instanceof JmapError && (error.type==="notFound" || error.type==="invalidArguments" && !/^t_[A-Za-z0-9_-]{1,128}$/.test(id)))notFound.push(id);else throw error; }
         }
         return {accountId:this.accountId,state,list,notFound};
       },

@@ -1,7 +1,7 @@
 import type { EmailBodyPart } from "../mapping/structure.js";
 import { selectBodies } from "../mapping/structure.js";
 import { asAddresses, asDate, asMessageIds, asText, projectHeaderProp } from "../imap/headers.js";
-import { invalidArguments } from "../jmap/errors.js";
+import { invalidArguments, JmapError } from "../jmap/errors.js";
 
 export interface GmailPart {
   partId?: string; mimeType?: string; filename?: string;
@@ -30,7 +30,7 @@ export function parseBlob(id: string): [string, string | null] {
     if (!Array.isArray(value) || value.length !== 2 || typeof value[0] !== "string" ||
         !/^[A-Za-z0-9_-]{1,128}$/.test(value[0]) || (value[1] !== null && typeof value[1] !== "string")) throw new Error();
     return value as [string, string | null];
-  } catch { throw invalidArguments("Invalid Gmail blob id"); }
+  } catch { throw new JmapError("notFound", "Invalid Gmail blob id"); }
 }
 export function partTree(message: GmailMessage): { root: EmailBodyPart; parts: Map<string, GmailPart> } {
   const parts = new Map<string, GmailPart>();
