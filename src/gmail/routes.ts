@@ -32,7 +32,7 @@ export async function registerGmailRoutes(app: FastifyInstance, options: {
     scope.addHook("onRequest", async (_request, reply) => {
       reply.header("Cache-Control", "no-store");
       reply.header("Referrer-Policy", "no-referrer");
-      reply.header("Content-Security-Policy", `default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`);
+      reply.header("Content-Security-Policy", `default-src 'none'; form-action 'self' https://accounts.google.com; frame-ancestors 'none'; base-uri 'none'`);
       reply.header("X-Content-Type-Options", "nosniff");
     });
     scope.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_req, _body, done) => done(null, {}));
