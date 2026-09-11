@@ -9,8 +9,8 @@ import type { MethodTable } from "../jmap/router.js";
 const hash = (value: unknown) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0,32);
 export const gmailAccountId = (email: string) => "g_" + hash(email.toLowerCase());
 const ROLES: Record<string, string> = { INBOX: "inbox", SENT: "sent", DRAFT: "drafts", SPAM: "junk", TRASH: "trash" };
-const MAX_GET = 50;
-const MAX_QUERY = 200;
+const MAX_GET = 100;
+const MAX_QUERY = 100;
 const MAX_BLOB = 50_000_000;
 
 export class GmailMail {

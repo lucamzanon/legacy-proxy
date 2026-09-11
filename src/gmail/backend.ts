@@ -45,7 +45,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     if (req.method === "GET" && path === "/jmap/session") {
       const mailProps = { maxMailboxesPerEmail: null, maxMailboxDepth: 1, maxSizeMailboxName: 1000,
         maxSizeAttachmentsPerEmail: 50_000_000, emailQuerySortOptions: ["receivedAt"], mayCreateTopLevelMailbox: false };
-      return reply.send({ capabilities: { [CORE_CAPABILITY]: { ...coreCapabilityProps(cfg), maxObjectsInGet: 50 }, [MAIL_CAPABILITY]: {} },
+      return reply.send({ capabilities: { [CORE_CAPABILITY]: { ...coreCapabilityProps(cfg), maxObjectsInGet: 100 }, [MAIL_CAPABILITY]: {} },
         accounts: { [mail.accountId]: { name: email, isPersonal: true, isReadOnly: true, accountCapabilities: { [MAIL_CAPABILITY]: mailProps } } },
         primaryAccounts: { [MAIL_CAPABILITY]: mail.accountId }, username: email,
         apiUrl: `${cfg.publicUrl}/jmap`, downloadUrl: `${cfg.publicUrl}/jmap/download/{accountId}/{blobId}/{type}/{name}`,
