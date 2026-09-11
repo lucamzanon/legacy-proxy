@@ -13,6 +13,7 @@ import { makeSession, signSession, verifySession } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
+import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
@@ -139,7 +140,11 @@ app.post("/jmap", async (req, reply) => {
     }
   }
   try {
-    const out = await dispatch(env, { cfg, pool, store, account, dispatcher });
+    const out = await dispatch(env, {
+      methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher }),
+      maxCallsInRequest: cfg.limits.maxCallsInRequest,
+      sessionState: `s${account.id}`,
+    });
     if (process.env.JMAP_DEBUG === "1") {
       log.info(
         { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },
