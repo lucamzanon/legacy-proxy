@@ -56,4 +56,4 @@ it("sanitizes Google errors before they reach JMAP or logs",async()=>{const {sto
 
 it("opens a large folder without scanning every page",async()=>{const {mail,store,get}=setup();store.cache(email,"profile",{...profile,messagesTotal:100000},60000);const result=await mail.methods()["Email/query"]!({accountId:mail.accountId,limit:2,calculateTotal:true});expect(result).toMatchObject({ids:["m_a","m_b"],total:100000});expect(get.mock.calls.filter(c=>c[0]==="messages")).toHaveLength(1);});
 
-it("treats unmapped client keywords as absent",()=>{expect(gmailFilter({hasKeyword:"$pinned"},labels)).toBe("in:anywhere -in:anywhere");expect(gmailFilter({notKeyword:"$pinned"},labels)).toBe("-(in:anywhere -in:anywhere)");});
+it("treats unmapped client keywords as absent",()=>{expect(gmailFilter({hasKeyword:"label/custom.tag"},labels)).toBe("in:anywhere -in:anywhere");expect(gmailFilter({notKeyword:"$pinned"},labels)).toBe("-(in:anywhere -in:anywhere)");});

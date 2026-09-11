@@ -8,7 +8,7 @@ const keyword = (value: unknown) => {
   if (value === "$flagged") return "is:starred";
   if (value === "$draft") return "in:drafts";
   if (value === "$important") return "is:important";
-  if (typeof value !== "string" || !/^[A-Za-z0-9_$-]{1,255}$/.test(value)) throw invalidArguments("Invalid keyword");
+  if (typeof value !== "string" || (!value || Buffer.byteLength(value) > 255 || /[\x00-\x20\x7f]/.test(value))) throw invalidArguments("Invalid keyword");
   // Gmail has no arbitrary JMAP keywords: absent keywords match no messages.
   return "in:anywhere -in:anywhere";
 };
