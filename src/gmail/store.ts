@@ -28,6 +28,10 @@ export class GmailStore {
     this.db = new Database(file);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS gmail_upload (email TEXT NOT NULL,id TEXT NOT NULL,body BLOB NOT NULL,type TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(email,id));
+      CREATE TABLE IF NOT EXISTS gmail_draft (email TEXT NOT NULL,original TEXT NOT NULL,current TEXT NOT NULL,draft TEXT NOT NULL,PRIMARY KEY(email,original));
+      CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
+      CREATE TABLE IF NOT EXISTS gmail_submission (email TEXT NOT NULL,original TEXT NOT NULL,id TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT,PRIMARY KEY(email,original));
       CREATE TABLE IF NOT EXISTS gmail_revision (email TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS gmail_cache (
@@ -114,6 +118,43 @@ export class GmailStore {
         total -= row.size;
       }
     })();
+  }
+  upload(email:string,body:Buffer,type:string):string {
+    const id="gu_"+crypto.randomBytes(24).toString("base64url");
+    this.db.transaction(()=>{
+      this.db.prepare("DELETE FROM gmail_upload WHERE expires<=?").run(Date.now());
+      const total=(this.db.prepare("SELECT COALESCE(SUM(length(body)),0) AS n FROM gmail_upload WHERE email=?").get(email) as {n:number}).n;
+      if(body.length>25_000_000 || total+body.length>100_000_000)throw new Error("Upload quota exceeded");
+      this.db.prepare("INSERT INTO gmail_upload VALUES(?,?,?,?,?)").run(email,id,body,type,Date.now()+24*60*60_000);
+    })();return id;
+  }
+  uploaded(email:string,id:string):{body:Buffer;type:string}|null {
+    return this.db.prepare("SELECT body,type FROM gmail_upload WHERE email=? AND id=? AND expires>?").get(email,id,Date.now()) as {body:Buffer;type:string}|undefined ?? null;
+  }
+  rememberDraft(email:string,original:string,draft:string,current=original):void {
+    this.db.prepare("INSERT INTO gmail_draft VALUES(?,?,?,?) ON CONFLICT(email,original) DO UPDATE SET current=excluded.current,draft=excluded.draft").run(email,original,current,draft);
+  }
+  draft(email:string,original:string):{current:string;draft:string}|null {
+    return this.db.prepare("SELECT current,draft FROM gmail_draft WHERE email=? AND original=?").get(email,original) as {current:string;draft:string}|undefined ?? null;
+  }
+  originalId(email:string,current:string):string {
+    return (this.db.prepare("SELECT original FROM gmail_draft WHERE email=? AND current=?").get(email,current) as {original:string}|undefined)?.original ?? current;
+  }
+  upstreamId(email:string,original:string):string {return this.draft(email,original)?.current ?? original;}
+  beginSubmission(email:string,original:string,fingerprint:string):boolean {
+    return this.db.prepare("INSERT OR IGNORE INTO gmail_submission(email,original,id,fingerprint) VALUES(?,?,?,?)").run(email,original,"gs_"+crypto.randomBytes(16).toString("hex"),fingerprint).changes===1;
+  }
+  submission(email:string,original:string):{id:string;fingerprint:string;result:string|null}|null {
+    return this.db.prepare("SELECT id,fingerprint,result FROM gmail_submission WHERE email=? AND original=?").get(email,original) as {id:string;fingerprint:string;result:string|null}|undefined ?? null;
+  }
+  finishSubmission(email:string,original:string,result:unknown,current:string):void {
+    this.db.transaction(()=>{
+      this.db.prepare("UPDATE gmail_submission SET result=? WHERE email=? AND original=?").run(JSON.stringify(result),email,original);
+      this.db.prepare("UPDATE gmail_draft SET current=? WHERE email=? AND original=?").run(current,email,original);
+    })();
+  }
+  submissionResults(email:string):Record<string,unknown>[] {
+    return (this.db.prepare("SELECT result FROM gmail_submission WHERE email=? AND result IS NOT NULL ORDER BY rowid DESC LIMIT 100").all(email) as {result:string}[]).map(r=>JSON.parse(r.result));
   }
   close(): void { this.db.close(); }
 }
