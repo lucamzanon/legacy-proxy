@@ -20,6 +20,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:compliance": "node scripts/run-compliance.mjs",
     "test:all": "npm run test && npm run test:integration && npm run test:compliance",
+    "gmail:password": "node --env-file=.env --env-file-if-exists=.env.local dist/gmail/password.js",
     "gmail:check": "node --env-file=.env --env-file-if-exists=.env.local dist/gmail/check.js"
   },
   "dependencies": {

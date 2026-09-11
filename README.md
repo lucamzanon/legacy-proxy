@@ -268,9 +268,10 @@ your own access token.
 
 ### Experimental Gmail API connection
 
-This opt-in OAuth flow prepares a Gmail API backend. It currently connects an
-account and caches its profile and label list; it does **not** expose Gmail API
-messages over JMAP yet. The existing `gmail` IMAP provider remains unchanged.
+This opt-in backend exposes Gmail labels, messages, threads and downloads over
+JMAP using the Gmail API and read-only OAuth consent. The existing `gmail` IMAP
+provider remains available separately. This is an experimental compatibility
+backend, not a complete RFC 8621 implementation.
 
 Create a Google **Web application** OAuth client, enable Gmail API, and add
 `https://www.googleapis.com/auth/gmail.readonly` to its data access settings.
@@ -300,9 +301,10 @@ the browser. Restarting the service invalidates pending authorization flows;
 start again if this happens during consent.
 
 Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
-The same database stores the initial profile and labels as plaintext metadata;
-protect `DATA_DIR` and its backups. This cache contains no message bodies, and
-its `historyId` is a profile observation, **not** a completed mail-sync cursor.
+The same database caches metadata, message bodies and attachment bytes in plaintext;
+protect `DATA_DIR` and its backups. Cached values expire and are bounded to 256 MiB
+of logical data per account (SQLite may retain free pages). Its `historyId` is a
+profile observation, **not** a completed mail-sync cursor.
 Google Testing refresh tokens with Gmail scopes expire after seven days; reconnect
 when consent expires or is revoked.
 
@@ -316,6 +318,44 @@ This refreshes the profile/label snapshot and prints only counts. No background
 mail sync or quota retry loop is enabled yet. Token refresh is coalesced within
 one process; run a single writer per data directory during this experimental
 stage. Google requests have timeouts, and failed checks retain the last snapshot.
+
+Create a dedicated JMAP password after consent, using a new private output path:
+
+```bash
+npm run gmail:password -- tester@gmail.com /private/path/jmap-login.json
+```
+
+The file contains `serverUrl`, `username` and `password` for the client's custom
+JMAP account. Only a SHA-256 hash of this randomly generated password is stored.
+Reissuing it immediately revokes the previous bridge password. Basic auth with
+that username/password or Bearer auth with the bridge password is supported;
+Google tokens stay on the server. Removing the email from the allowlist and
+restarting also blocks access, including to cached data.
+
+Expose `/jmap`, `/jmap/*` and `/.well-known/jmap` alongside the OAuth routes at
+the HTTPS reverse proxy. Account and mailbox rights are read-only: writes and
+uploads fail, and submission/push capabilities are not advertised. Clients poll
+for changes; a changed state requires a full client refresh (`cannotCalculateChanges`).
+
+Ordinary newest-first folder pages use exact label/profile counts and fetch only
+the required ID pages. Searches, oldest-first ordering, anchors and collapsed
+thread queries enumerate matching IDs before slicing, which can be slow on large
+accounts. Gmail's estimated search total is never returned as an exact total.
+Profiles refresh after 30 seconds, label details after at most 60 seconds; cached
+queries are keyed by observed history state. Gmail does not provide a transactional
+snapshot across pages, so concurrent mailbox changes can still affect pagination.
+
+Email IDs are stable across labels. The synthetic `All mail` mailbox includes
+**spam and trash**, matching the account-wide profile counts. Label names are
+flat. Only `receivedAt` sorting is accepted, using Gmail's native list order
+(or its reverse); strict timestamp ordering is not guaranteed by the list API.
+Supported search conditions are mailbox, the four standard mapped keywords,
+address fields, subject/text, dates, sizes and attachment presence, combined with
+AND/OR/NOT. Searches inherit Gmail token matching and date granularity; other
+conditions, including `inMailboxOtherThan`, are rejected. Header/body projections
+and on-demand MIME part downloads are supported; downloads are capped at 50 MB.
+The gateway limits each account to four concurrent Google requests and budgets
+4,800 quota units/minute using the [current method costs](https://developers.google.com/workspace/gmail/api/reference/quota).
 
 For a proxy behind a reverse proxy on the same host, `LISTEN_HOST=127.0.0.1`
 restricts the HTTP listener to loopback (the default remains `0.0.0.0`).

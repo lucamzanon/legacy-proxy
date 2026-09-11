@@ -22,6 +22,7 @@ import { PushIdleManager } from "./push/idle.js";
 import { loadGmailConfig } from "./gmail/config.js";
 import { GmailStore } from "./gmail/store.js";
 import { GmailConnection } from "./gmail/connection.js";
+import { registerGmailBackend } from "./gmail/backend.js";
 import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfig();
@@ -68,6 +69,7 @@ const gmailConfig = loadGmailConfig(cfg.publicUrl);
 if (gmailConfig) {
   const gmailStore = new GmailStore(cfg.dataDir, cfg.vaultKey);
   const connection = new GmailConnection(gmailConfig, gmailStore);
+  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection);
   await app.register(registerGmailRoutes, { config: gmailConfig, connection });
   app.addHook("onClose", async () => gmailStore.close());
 }

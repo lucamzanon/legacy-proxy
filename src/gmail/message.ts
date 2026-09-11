@@ -1,0 +1,109 @@
+import type { EmailBodyPart } from "../mapping/structure.js";
+import { selectBodies } from "../mapping/structure.js";
+import { asAddresses, asDate, asMessageIds, asText, projectHeaderProp } from "../imap/headers.js";
+import { invalidArguments } from "../jmap/errors.js";
+
+export interface GmailPart {
+  partId?: string; mimeType?: string; filename?: string;
+  headers?: { name: string; value: string }[];
+  body?: { data?: string; attachmentId?: string; size?: number };
+  parts?: GmailPart[];
+}
+export interface GmailMessage {
+  id: string; threadId: string; labelIds?: string[]; snippet?: string;
+  internalDate: string; sizeEstimate?: number; payload?: GmailPart;
+}
+export const ALL_MAIL = "all";
+export function upstreamId(id: unknown, prefix: string): string {
+  if (typeof id !== "string" || !id.startsWith(prefix) || !/^[A-Za-z0-9_-]{1,128}$/.test(id.slice(prefix.length))) {
+    throw invalidArguments("Invalid Gmail object id");
+  }
+  return id.slice(prefix.length);
+}
+export function blobId(messageId: string, partId: string | null): string {
+  return "gb_" + Buffer.from(JSON.stringify([messageId, partId])).toString("base64url");
+}
+export function parseBlob(id: string): [string, string | null] {
+  try {
+    if (!id.startsWith("gb_") || id.length > 512) throw new Error();
+    const value: unknown = JSON.parse(Buffer.from(id.slice(3), "base64url").toString());
+    if (!Array.isArray(value) || value.length !== 2 || typeof value[0] !== "string" ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(value[0]) || (value[1] !== null && typeof value[1] !== "string")) throw new Error();
+    return value as [string, string | null];
+  } catch { throw invalidArguments("Invalid Gmail blob id"); }
+}
+export function partTree(message: GmailMessage): { root: EmailBodyPart; parts: Map<string, GmailPart> } {
+  const parts = new Map<string, GmailPart>();
+  function walk(p: GmailPart, fallback: string): EmailBodyPart {
+    const id = p.partId || fallback;
+    const headers = p.headers ?? [];
+    const header = (name: string) => headers.find((h) => h.name.toLowerCase() === name)?.value;
+    const type = (p.mimeType ?? "application/octet-stream").toLowerCase();
+    const multipart = type.startsWith("multipart/");
+    if (!multipart) parts.set(id, p);
+    const charset = /charset\s*=\s*"?([^";\s]+)/i.exec(header("content-type") ?? "")?.[1] ?? null;
+    return {
+      partId: multipart ? null : id, blobId: multipart ? null : blobId(message.id, id),
+      size: p.body?.size ?? 0, headers, name: p.filename || null, type, charset,
+      disposition: header("content-disposition")?.split(";")[0]?.trim().toLowerCase() ?? null,
+      cid: header("content-id")?.replace(/^<|>$/g, "") ?? null,
+      language: header("content-language")?.split(",").map((s) => s.trim()) ?? null,
+      location: header("content-location") ?? null, encoding: null,
+      subParts: multipart ? (p.parts ?? []).map((child, i) => walk(child, `${id}.${i}`)) : null,
+    };
+  }
+  return { root: walk(message.payload ?? {}, "root"), parts };
+}
+export async function mapMessage(message: GmailMessage, args: Record<string, unknown>, getBytes: (p: GmailPart) => Promise<Buffer>): Promise<Record<string, unknown>> {
+  const headers = (message.payload?.headers ?? []).map((h) => ({ name: h.name, rawValue: h.value }));
+  const { root, parts } = partTree(message);
+  const bodies = selectBodies(root);
+  const keywords: Record<string, true> = {};
+  const labels = message.labelIds ?? [];
+  if (!labels.includes("UNREAD")) keywords.$seen = true;
+  if (labels.includes("STARRED")) keywords.$flagged = true;
+  if (labels.includes("DRAFT")) keywords.$draft = true;
+  if (labels.includes("IMPORTANT")) keywords.$important = true;
+  const bodyValues: Record<string, unknown> = {};
+  const requested = args.properties as string[] | null | undefined;
+  if ((!requested || requested.includes("bodyValues")) && (args.fetchTextBodyValues || args.fetchHTMLBodyValues || args.fetchAllBodyValues)) {
+    const selected = new Set([
+      ...(args.fetchTextBodyValues ? bodies.textBody.map((p) => p.partId) : []),
+      ...(args.fetchHTMLBodyValues ? bodies.htmlBody.map((p) => p.partId) : []),
+    ]);
+    const max = typeof args.maxBodyValueBytes === "number" ? args.maxBodyValueBytes : 256_000;
+    if (!Number.isSafeInteger(max) || max < 0 || max > 8_000_000) throw invalidArguments("maxBodyValueBytes must be between 0 and 8000000");
+    for (const [id, part] of parts) {
+      if (!(part.mimeType ?? "").startsWith("text/") || (!args.fetchAllBodyValues && !selected.has(id))) continue;
+      const bytes = await getBytes(part);
+      const type = (part.headers ?? []).find((h) => h.name.toLowerCase() === "content-type")?.value ?? "";
+      const charset = /charset\s*=\s*"?([^";\s]+)/i.exec(type)?.[1] ?? "utf-8";
+      let value: string; let isEncodingProblem = false;
+      try { value = new TextDecoder(charset, { fatal: true }).decode(bytes); }
+      catch { value = bytes.toString("utf8"); isEncodingProblem = true; }
+      const utf8 = Buffer.from(value);
+      const truncated = utf8.length > max;
+      // stream:true avoids introducing a replacement character when the limit cuts a UTF-8 code point.
+      if (truncated) value = new TextDecoder().decode(utf8.subarray(0, max), { stream: true });
+      bodyValues[id] = { value, isEncodingProblem, isTruncated: truncated };
+    }
+  }
+  const record: Record<string, unknown> = {
+    id: `m_${message.id}`, threadId: `t_${message.threadId}`, blobId: blobId(message.id, null),
+    mailboxIds: Object.fromEntries([ALL_MAIL, ...labels.map((id) => `l_${id}`)].map((id) => [id, true])),
+    keywords, size: message.sizeEstimate ?? 0, receivedAt: new Date(Number(message.internalDate)).toISOString(),
+    messageId: asMessageIds(headers, "Message-ID"), inReplyTo: asMessageIds(headers, "In-Reply-To"), references: asMessageIds(headers, "References"),
+    sender: asAddresses(headers, "Sender"), from: asAddresses(headers, "From"), to: asAddresses(headers, "To"), cc: asAddresses(headers, "Cc"),
+    bcc: asAddresses(headers, "Bcc"), replyTo: asAddresses(headers, "Reply-To"), subject: asText(headers, "Subject") ?? "",
+    sentAt: asDate(headers, "Date"), preview: message.snippet ?? "", headers: message.payload?.headers ?? [],
+    bodyStructure: root, ...bodies, bodyValues,
+  };
+  if (!requested) return record;
+  const result: Record<string, unknown> = { id: record.id };
+  for (const property of requested) {
+    if (property.startsWith("header:")) result[property] = projectHeaderProp(headers, property);
+    else if (property in record) result[property] = record[property];
+    else throw invalidArguments(`Unsupported Email property: ${property}`);
+  }
+  return result;
+}
