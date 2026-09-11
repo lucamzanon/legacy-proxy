@@ -266,6 +266,63 @@ Gmail wants an [App Password](https://support.google.com/accounts/answer/185833)
 (2FA must be on). Use `"provider": "gmail"`. XOAUTH2 also works if you bring
 your own access token.
 
+### Experimental Gmail API connection
+
+This opt-in OAuth flow prepares a Gmail API backend. It currently connects an
+account and caches its profile and label list; it does **not** expose Gmail API
+messages over JMAP yet. The existing `gmail` IMAP provider remains unchanged.
+
+Create a Google **Web application** OAuth client, enable Gmail API, and add
+`https://www.googleapis.com/auth/gmail.readonly` to its data access settings.
+For personal Gmail development, use an External application in Testing and add
+the Gmail address as a test user. Register this exact redirect URI, replacing
+the origin with the proxy's `PUBLIC_URL`:
+
+```text
+https://bridge.example.com/auth/google/callback
+```
+
+Store the downloaded client JSON outside the repository, readable only by the
+service account. Configure the proxy:
+
+```dotenv
+PUBLIC_URL=https://bridge.example.com
+GMAIL_OAUTH_CLIENT_FILE=/etc/legacy-proxy/google-oauth.json
+GMAIL_ALLOWED_EMAILS=tester@gmail.com
+```
+
+`GMAIL_ALLOWED_EMAILS` is a required comma-separated allowlist. The Gmail profile
+returned by Google determines whether the account is allowed; form values and
+login hints are not trusted. Visit `/auth/google/start` and click **Connect Gmail**.
+The flow uses PKCE, a browser-bound HttpOnly cookie, and single-use state expiring
+after ten minutes. Callback logs are suppressed and no tokens are returned to
+the browser. Restarting the service invalidates pending authorization flows;
+start again if this happens during consent.
+
+Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
+The same database stores the initial profile and labels as plaintext metadata;
+protect `DATA_DIR` and its backups. This cache contains no message bodies, and
+its `historyId` is a profile observation, **not** a completed mail-sync cursor.
+Google Testing refresh tokens with Gmail scopes expire after seven days; reconnect
+when consent expires or is revoked.
+
+After building, verify the saved connection (including token refresh when needed):
+
+```bash
+npm run gmail:check -- tester@gmail.com
+```
+
+This refreshes the profile/label snapshot and prints only counts. No background
+mail sync or quota retry loop is enabled yet. Token refresh is coalesced within
+one process; run a single writer per data directory during this experimental
+stage. Google requests have timeouts, and failed checks retain the last snapshot.
+
+For a proxy behind a reverse proxy on the same host, `LISTEN_HOST=127.0.0.1`
+restricts the HTTP listener to loopback (the default remains `0.0.0.0`).
+
+Google setup references: [OAuth web flow](https://developers.google.com/identity/protocols/oauth2/web-server),
+[Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
+
 ### TLS
 
 The proxy only speaks plain HTTP. Put Caddy, Traefik, or nginx in front of it
