@@ -36,7 +36,9 @@ export async function registerGmailRoutes(app: FastifyInstance, options: {
       reply.header("X-Content-Type-Options", "nosniff");
     });
     scope.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_req, _body, done) => done(null, {}));
-    scope.get("/auth/google/start", { logLevel: "silent" }, async (_req, reply) => reply.type("text/html").send(page(
+    // no-referrer makes browsers send Origin: null on native form POSTs.
+    // Keep the origin on this form page; callbacks retain no-referrer above.
+    scope.get("/auth/google/start", { logLevel: "silent" }, async (_req, reply) => reply.header("Referrer-Policy", "same-origin").type("text/html").send(page(
       '<p>Connect your Gmail account with read-only access. Only accounts enabled by the operator can connect.</p><form method="post" action="/auth/google/start"><button type="submit">Connect Gmail</button></form>',
     )));
     scope.post("/auth/google/start", { logLevel: "silent" }, async (req, reply) => {

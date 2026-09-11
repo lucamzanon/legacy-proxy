@@ -126,7 +126,10 @@ describe("OAuth routes", () => {
   it("requires a same-origin POST to start a flow", async () => {
     const { app, connection } = await setup();
     try {
-      expect((await app.inject("/auth/google/start")).statusCode).toBe(200);
+      const page = await app.inject("/auth/google/start");
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["referrer-policy"]).toBe("same-origin");
+      expect((await app.inject({ method: "POST", url: "/auth/google/start", headers: { origin: "null" } })).statusCode).toBe(403);
       expect((await app.inject({ method: "POST", url: "/auth/google/start", headers: { origin: "https://evil.example" } })).statusCode).toBe(403);
       expect(connection.authorization).not.toHaveBeenCalled();
     } finally { await app.close(); }
