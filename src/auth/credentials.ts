@@ -8,6 +8,7 @@ export interface Credentials {
   refreshToken?: string;
   /** OAuth access-token expiry in epoch milliseconds. */
   expiresAt?: number;
+  scopes?: string[];
 }
 
 // Format: [12-byte nonce | 16-byte tag | ciphertext]

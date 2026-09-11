@@ -28,6 +28,7 @@ export class GmailStore {
     this.db = new Database(file);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS gmail_revision (email TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS gmail_cache (
         email TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
@@ -71,14 +72,23 @@ export class GmailStore {
     const row = this.db.prepare("SELECT email FROM gmail_password WHERE hash=?").get(hash) as { email: string } | undefined;
     return row && (!username || row.email === username.toLowerCase()) ? row.email : null;
   }
-  async updateCredentials(email: string, credentials: Credentials, expectedRefreshToken?: string): Promise<void> {
+  async updateCredentials(email: string, credentials: Credentials, expectedRefreshToken?: string, snapshot?: GmailSnapshot): Promise<void> {
     const row = this.db.prepare("SELECT vault FROM gmail_connection WHERE email=?").get(email) as { vault: Buffer } | undefined;
     if (!row) return;
     const old = await openCredentials(this.vaultKey, row.vault);
     if (old.refreshToken !== expectedRefreshToken ||
-        (old.accessToken === credentials.accessToken && old.expiresAt === credentials.expiresAt)) return;
-    const vault = await sealCredentials(this.vaultKey, credentials);
-    this.db.prepare("UPDATE gmail_connection SET vault=? WHERE email=? AND vault=?").run(vault, email, row.vault);
+        (snapshot === undefined && old.accessToken === credentials.accessToken && old.expiresAt === credentials.expiresAt)) return;
+    const vault = await sealCredentials(this.vaultKey, {...credentials,scopes:old.scopes});
+    this.db.prepare("UPDATE gmail_connection SET vault=?,snapshot=COALESCE(?,snapshot) WHERE email=? AND vault=?").run(vault, snapshot ? JSON.stringify(snapshot) : null, email, row.vault);
+  }
+  revision(email: string): number {
+    return (this.db.prepare("SELECT revision FROM gmail_revision WHERE email=?").get(email) as {revision:number}|undefined)?.revision ?? 0;
+  }
+  invalidate(email: string): void {
+    this.db.transaction(() => {
+      this.db.prepare("INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1").run(email);
+      this.db.prepare("DELETE FROM gmail_cache WHERE email=?").run(email);
+    })();
   }
   cached<T>(email: string, key: string): T | null {
     const row = this.db.prepare("SELECT value FROM gmail_cache WHERE email=? AND key=? AND expires>?")

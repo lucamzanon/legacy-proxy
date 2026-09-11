@@ -2,7 +2,10 @@ import fs from "node:fs";
 
 export const GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly";
 
+export const GMAIL_MODIFY = "https://www.googleapis.com/auth/gmail.modify";
+
 export interface GmailConfig {
+  writeEnabled?: boolean;
   clientId: string;
   clientSecret: string;
   redirectUri: string;
@@ -29,6 +32,7 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
     .split(",").map((email) => email.trim().toLowerCase()).filter(Boolean));
   if (!allowedEmails.size) throw new Error("GMAIL_ALLOWED_EMAILS must name the accounts allowed to connect");
   return {
+    writeEnabled: process.env.GMAIL_WRITE_ENABLED === "true",
     clientId: web.client_id, clientSecret: web.client_secret,
     origin: base.origin, redirectUri: `${base.origin}/auth/google/callback`,
     allowedEmails, secureCookies: base.protocol === "https:",
