@@ -66,11 +66,12 @@ await app.register(compress, { global: true, threshold: 1024 });
 const gmailConfig = loadGmailConfig(cfg.publicUrl);
 const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
 // Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
-app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}) }));
+const gmailHooks: { push?: import("./gmail/push.js").GmailPush } = {};
+app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}), ...(gmailHooks.push ? { gmailPush: gmailHooks.push.stats() } : {}) }));
 
 if (gmailConfig && gmailStore) {
   const connection = new GmailConnection(gmailConfig, gmailStore);
-  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection);
+  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection, gmailHooks);
   await app.register(registerGmailRoutes, { config: gmailConfig, connection });
   app.addHook("onClose", async () => gmailStore.close());
 }

@@ -18,7 +18,7 @@ export class GmailApi {
     return this.request<T>(resource,cost,params);
   }
   async mutate<T>(resource: string, cost: number, method: "POST" | "PATCH" | "DELETE", data?: unknown): Promise<T> {
-    const allowed = method === "POST" && (resource === "labels" || /^messages\/[A-Za-z0-9_-]+\/modify$/.test(resource)) ||
+    const allowed = method === "POST" && (resource === "labels" || resource === "watch" || resource === "stop" || /^messages\/[A-Za-z0-9_-]+\/modify$/.test(resource)) ||
       (method === "PATCH" || method === "DELETE") && /^labels\/[A-Za-z0-9_-]+$/.test(resource);
     const compose = this.connection.config?.composeEnabled && (
       method === "POST" && (resource === "drafts" || resource === "drafts/send") ||
