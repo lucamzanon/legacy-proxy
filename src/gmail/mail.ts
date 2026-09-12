@@ -24,12 +24,14 @@ export class GmailMail {
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
   private flights = new Map<string, Promise<unknown>>();
-  constructor(private email: string, private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>, private store: GmailStore, private writeEnabled = false, private composeEnabled = false, private aliasesEnabled = false) {
+  constructor(private email: string, private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>, private store: GmailStore, private writeEnabled = false, private composeEnabled = false, private aliasesEnabled = false, private schedule?: {maxDelayedSend:number;lateTolerance:number}) {
     this.accountId = gmailAccountId(email);
     this.composer=new GmailCompose({email,accountId:this.accountId,api:api as Pick<GmailApi,"get"|"mutate">,store,
       enabled:()=>this.canCompose(),state:()=>this.state(),download:id=>this.download(id),exclusive:work=>this.exclusive(work),
-      ...(aliasesEnabled?{sendAs:(fresh:boolean)=>this.sendAs(fresh)}:{})});
+      ...(aliasesEnabled?{sendAs:(fresh:boolean)=>this.sendAs(fresh)}:{}),...(schedule?{schedule}:{})});
   }
+  /** Worker entry point: sends due scheduled submissions under the account write lock. */
+  runScheduled(now=Date.now()):Promise<void>{return this.exclusive(()=>this.composer.runDue(now));}
   private async cached<T>(key: string, ttl: number, fetch: () => Promise<T>): Promise<T> {
     const cached = this.store.cached<T>(this.email, key);
     if (cached !== null) return cached;
