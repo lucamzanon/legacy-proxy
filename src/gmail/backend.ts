@@ -12,7 +12,7 @@ import { GmailMail } from "./mail.js";
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyInstance<RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression, L>, cfg: AppConfig, google: GmailConfig,
   store: GmailStore, connection: GmailConnection,
-  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false, google.composeEnabled ?? false)): void {
+  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false, google.composeEnabled ?? false, google.aliasesEnabled ?? false)): void {
   const accounts = new Map<string, GmailMail>();
   const authenticated = new WeakMap<object, { email: string; mail: GmailMail; uploadType?: string }>();
   app.addHook("onRequest", async (req, reply) => {

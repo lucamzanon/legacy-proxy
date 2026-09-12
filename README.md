@@ -372,8 +372,22 @@ Gmail updates still use the polling/full-refresh behavior described below.
 
 Set `GMAIL_COMPOSE_ENABLED=true` together with `GMAIL_WRITE_ENABLED=true` to enable
 composition. The existing verified `gmail.modify` grant is sufficient; reload the
-client to discover the submission capability. The initial identity is the connected
-account address only; aliases and identity editing are not supported yet.
+client to discover the submission capability. By default the only identity is the
+connected account address.
+
+Set `GMAIL_ALIASES_ENABLED=true` to also expose the addresses configured under
+Gmail's "Send mail as" (`users.settings.sendAs`, readable with the existing
+`gmail.modify` grant, no new consent) as JMAP identities. The primary address keeps
+its identity id and gains Gmail's display name and reply-to; every alias whose
+verification status is `accepted` gets a stable id derived from the account and the
+address. Pending or failed aliases are never offered. Identities are read-only:
+create or edit aliases in Gmail or the Workspace admin console. Signatures are left
+empty on purpose so the client's own signatures apply; Google signatures are not
+imported. Settings are cached for five minutes; if Gmail settings are temporarily
+unreachable, `Identity/get` degrades to the primary address. Drafts and MIME
+imports may use any listed address in `From`. Before sending, the bridge re-reads
+the settings: an alias removed meanwhile yields `forbiddenFrom` and the draft is
+retained, and a draft whose `From` does not match the chosen identity is refused.
 
 The compose path supports plain text, HTML, Cc/Bcc, reply headers, MIME body
 structures, inline parts and uploaded or existing message attachments. New mail
