@@ -1,3 +1,4 @@
+import { readHistory, affected, emailDelta } from './history.js';
 import { GmailCompose } from "./compose.js";
 import { GMAIL_MODIFY } from "./config.js";
 import { emailPatch, labelInput, writableLabel } from "./write.js";
@@ -21,6 +22,7 @@ export class GmailMail {
   private composer: GmailCompose;
   private writeTail: Promise<unknown> = Promise.resolve();
   private queuedWrites = 0;
+  private syncFlight?: Promise<void>;
   private flights = new Map<string, Promise<unknown>>();
   constructor(private email: string, private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>, private store: GmailStore, private writeEnabled = false, private composeEnabled = false) {
     this.accountId = gmailAccountId(email);
@@ -40,12 +42,41 @@ export class GmailMail {
     this.flights.set(flightKey, task);
     return task;
   }
-  profile(): Promise<GmailProfile> { return this.cached("profile", 30_000, () => this.api.get<GmailProfile>("profile", 1)); }
+  async profile(): Promise<GmailProfile> {
+    const profile=await this.cached("profile",30_000,()=>this.api.get<GmailProfile>("profile",1));
+    if(this.syncFlight)await this.syncFlight;
+    const cursor=this.store.cursor(this.email);
+    if(cursor===profile.historyId)return profile;
+    if(!cursor){this.store.checkpoint(this.email,profile.historyId,[],[]);return profile;}
+    // A stale concurrent profile response must not move a persisted cursor backwards.
+    if(BigInt(profile.historyId)<BigInt(cursor)){
+      const fresh=await this.api.get<GmailProfile>("profile",1);
+      this.store.cache(this.email,"profile",fresh,30_000);
+      if(BigInt(fresh.historyId)>BigInt(cursor))return this.profile();
+      return {...fresh,historyId:cursor};
+    }
+    const revision=this.store.revision(this.email);
+    this.syncFlight=(async()=>{
+      try{
+        const history=await readHistory(this.api,cursor);
+        if(this.store.revision(this.email)===revision){const changed=affected(history.records);this.store.checkpoint(this.email,history.historyId,changed.messages,changed.threads);}
+      }catch(e){
+        if(!(e instanceof JmapError)||e.type!=="cannotCalculateChanges")throw e;
+        if(this.store.revision(this.email)===revision)this.store.checkpoint(this.email,profile.historyId,[],[],true);
+      }
+    })().finally(()=>{this.syncFlight=undefined;});
+    await this.syncFlight;
+    return {...profile,historyId:this.store.cursor(this.email)??profile.historyId};
+  }
   async writable(): Promise<boolean> { return this.writeEnabled && !!(await this.store.load(this.email))?.credentials.scopes?.includes(GMAIL_MODIFY); }
   async canCompose():Promise<boolean>{return this.composeEnabled && await this.writable();}
   async upload(body:Buffer,type:string):Promise<string>{if(!await this.canCompose())throw new JmapError("accountReadOnly");try{return this.store.upload(this.email,body,type);}catch{throw new JmapError("tooLarge","Upload quota exceeded");}}
   async state(): Promise<string> { const history=(await this.profile()).historyId;const revision=this.store.revision(this.email);return "g"+history+(revision?"r"+revision:""); }
-  async mailboxState(): Promise<string> { return hash(await this.mailboxes()); }
+  async mailboxState(): Promise<string> {
+    const records=await this.mailboxes();const state=hash(records);
+    this.store.mailboxSnapshot(this.email,state,Object.fromEntries(records.map(r=>[r.id as string,hash(r)])));
+    return state;
+  }
   async labels(): Promise<GmailLabel[]> {
     const state = await this.state();
     return this.cached("labels:" + state, 60_000, async () => {
@@ -98,8 +129,8 @@ export class GmailMail {
   }
   async message(id: string): Promise<GmailMessage> {
     id=this.store.upstreamId(this.email,id);
-    const state = await this.state();
-    return this.cached(`message:${state}:${id}`, 30 * 60_000,
+    await this.state();
+    return this.cached(`message:v2:${id}`, 30 * 60_000,
       () => this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`,20,{ format: "full" }));
   }
   private async bytes(messageId: string, part: GmailPart): Promise<Buffer> {
@@ -288,6 +319,31 @@ export class GmailMail {
       created:Object.keys(created).length?created:null,updated:Object.keys(updated).length?updated:null,destroyed:destroyed.length?destroyed:null,
       notCreated:Object.keys(notCreated).length?notCreated:null,notUpdated:Object.keys(notUpdated).length?notUpdated:null,notDestroyed:Object.keys(notDestroyed).length?notDestroyed:null};
   }
+  private async emailChanges(a:Record<string,unknown>):Promise<unknown>{
+    this.account(a);const oldState=a.sinceState;
+    if(typeof oldState!=="string"||!/^g[0-9]+(?:r[0-9]+)?$/.test(oldState))throw new JmapError("cannotCalculateChanges");
+    const max=a.maxChanges??10000;if(!Number.isSafeInteger(max)||(max as number)<1)throw invalidArguments("Invalid maxChanges");
+    const current=await this.state();
+    if(oldState===current)return {accountId:this.accountId,oldState,newState:current,hasMoreChanges:false,created:[],updated:[],destroyed:[]};
+    const start=/^g([0-9]+)/.exec(oldState)![1]!;
+    if(start===/^g([0-9]+)/.exec(current)![1])throw new JmapError("cannotCalculateChanges");
+    const history=await readHistory(this.api,start);
+    const delta=emailDelta(history.records,id=>this.store.originalId(this.email,id));
+    if(delta.created.length+delta.updated.length+delta.destroyed.length>(max as number))throw new JmapError("cannotCalculateChanges","Too many changes; reload the current mailbox");
+    // Do not claim that a later history cursor is already reflected in local cached reads.
+    const changed=affected(history.records);this.store.checkpoint(this.email,history.historyId,changed.messages,changed.threads);
+    return {accountId:this.accountId,oldState,newState:"g"+history.historyId+(this.store.revision(this.email)?"r"+this.store.revision(this.email):""),hasMoreChanges:false,...delta};
+  }
+  private async mailboxChanges(a:Record<string,unknown>):Promise<unknown>{
+    this.account(a);const oldState=a.sinceState;if(typeof oldState!=="string")throw invalidArguments("Missing sinceState");
+    const max=a.maxChanges??10000;if(!Number.isSafeInteger(max)||(max as number)<1)throw invalidArguments("Invalid maxChanges");
+    const before=this.store.mailboxSnapshot(this.email,oldState);const newState=await this.mailboxState();
+    if(!before)throw new JmapError("cannotCalculateChanges");
+    const after=this.store.mailboxSnapshot(this.email,newState)!;
+    const created=Object.keys(after).filter(id=>!(id in before)),destroyed=Object.keys(before).filter(id=>!(id in after)),updated=Object.keys(after).filter(id=>id in before&&after[id]!==before[id]);
+    if(created.length+destroyed.length+updated.length>(max as number))throw new JmapError("cannotCalculateChanges");
+    return {accountId:this.accountId,oldState,newState,hasMoreChanges:false,created,updated,destroyed,updatedProperties:null};
+  }
   methods(): MethodTable {
     const changes = async (a: Record<string,unknown>) => {
       this.account(a); const state = await this.state();
@@ -336,16 +392,17 @@ export class GmailMail {
         const list:Record<string,unknown>[]=[];const notFound:string[]=[];const state=await this.state();
         for(const id of ids) {
           try {
-            const thread=await this.cached<{ id:string;messages?:GmailMessage[] }>(`thread:${state}:${id}`,30*60_000,
+            const revision=this.store.revision(this.email);
+            const thread=await this.cached<{ id:string;messages?:GmailMessage[] }>(`thread:v2:${id}`,30*60_000,
               ()=>this.api.get(`threads/${encodeURIComponent(upstreamId(id,"t_"))}`,40,{format:"full"}));
-            for(const message of thread.messages??[])this.store.cache(this.email,`message:${state}:${message.id}`,message,30*60_000);
+            if(this.store.revision(this.email)===revision)for(const message of thread.messages??[])this.store.cache(this.email,`message:v2:${message.id}`,message,30*60_000);
             const messages=[...(thread.messages??[])].sort((a,b)=>Number(a.internalDate)-Number(b.internalDate));
             list.push(this.project({id, emailIds:messages.map((m)=>"m_"+this.store.originalId(this.email,m.id))},properties));
           } catch(error) { if(error instanceof JmapError && (error.type==="notFound" || error.type==="invalidArguments" && !/^t_[A-Za-z0-9_-]{1,128}$/.test(id)))notFound.push(id);else throw error; }
         }
         return {accountId:this.accountId,state,list,notFound};
       },
-      "Email/changes":changes,"Mailbox/changes":async(a)=>{this.account(a);const state=await this.mailboxState();if(a.sinceState!==state)throw new JmapError("cannotCalculateChanges");return {accountId:this.accountId,oldState:state,newState:state,hasMoreChanges:false,created:[],updated:[],destroyed:[]};},"Thread/changes":changes,
+      "Email/changes":a=>this.emailChanges(a),"Mailbox/changes":a=>this.mailboxChanges(a),"Thread/changes":changes,
       "Email/queryChanges":async(a)=>{this.account(a);throw new JmapError("cannotCalculateChanges");},
       "Mailbox/set":(a)=>this.set("Mailbox",a),"Email/set":(a)=>this.set("Email",a),"Email/copy":readOnly,
       "SearchSnippet/get":async(a)=>{this.account(a);return {accountId:this.accountId,list:[],notFound:a.emailIds??[]};},

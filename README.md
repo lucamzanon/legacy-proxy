@@ -520,3 +520,28 @@ alone does not enable a provider. The existing `gmail` provider still uses IMAP.
 ## License
 
 AGPL-3.0
+
+### Incremental sync and recovery
+
+The Gmail bridge now reads `users.history.list` when the observed profile history
+advances. It commits the cursor only after all pages have been read, invalidates
+changed message/thread caches, and retains unchanged message bodies and attachment
+bytes. The cursor is stored in SQLite and survives process restarts. Google history
+expiry triggers cache reset and on-demand reload of the currently viewed mail;
+there is no full-account body download. History work is bounded to 100 pages / 50,000
+records; larger gaps use the same reload path.
+
+`Email/changes` returns coalesced created/updated/destroyed IDs, including stable
+sent-draft aliases. `Mailbox/changes` compares the last 32 persisted snapshots,
+including counts and label renames. Unknown/expired states or changes exceeding the
+caller's `maxChanges` return `cannotCalculateChanges`; the client reloads the current
+view. `Thread/changes` and `Email/queryChanges` still fall back to requery. Sync is
+triggered by client requests/polling (profile cache up to 30 seconds), not background
+push. Direct bridge writes still invalidate the account cache conservatively.
+
+Transient read network errors receive bounded retries; writes never automatically
+retry. Revoked/expired grants return a sanitized reconnect instruction, without
+exposing Google tokens or upstream errors. Uncertain sends explicitly instruct the
+user to check Sent and leave the durable submission intent in place across restarts.
+Reply composition resolves the parent Message-ID in the same account and supplies
+Gmail's native thread ID only when the parent header and normalized subject match.

@@ -129,3 +129,14 @@ it('allows only native draft routes when composition is enabled at the gateway',
  await expect(api.mutate('messages/a',10,'DELETE')).rejects.toMatchObject({type:'forbidden'});await expect(api.mutate('messages/send',100,'POST',{})).rejects.toMatchObject({type:'forbidden'});
  const disabled=new GmailApi(email,{config:{writeEnabled:true},createClient:()=>client} as any,store);await expect(disabled.mutate('drafts/send',100,'POST',{id:'fake'})).rejects.toMatchObject({type:'forbidden'});
 });
+it('attaches replies to the original Gmail thread after verifying Message-ID and subject',async()=>{
+ const {mail,get,mutate,save}=await setup();const implementation=get.getMockImplementation()!;
+ get.mockImplementation(async(resource:string,cost:number,params:any={})=>{
+  if(resource==='messages')return {messages:[{id:'parent',threadId:'original-thread'}]};
+  if(resource==='messages/parent')return {id:'parent',threadId:'original-thread',payload:{headers:[{name:'Message-ID',value:'<parent@example.test>'},{name:'Subject',value:'Original'}]}};
+  return implementation(resource,cost,params);
+ });
+ await save({subject:'Re: Original',inReplyTo:['parent@example.test'],references:['parent@example.test']});
+ expect(mutate.mock.calls.find(c=>c[0]==='drafts')?.[3].message.threadId).toBe('original-thread');
+ mutate.mockClear();await save({subject:'Changed subject',inReplyTo:['parent@example.test']});expect(mutate.mock.calls.find(c=>c[0]==='drafts')?.[3].message.threadId).toBeUndefined();
+});
