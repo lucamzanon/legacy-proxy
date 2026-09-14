@@ -83,12 +83,13 @@ it('renews the watch daily, records failures and retries on the next check',asyn
 it('advertises the event source and serves it only when push is configured',async()=>{
  const {store,mail}=await setup();
  for(const configured of [true,false]){
-  const app=Fastify();cleanup.push(()=>{void app.close();});
+  const lines:string[]=[];const app=Fastify({logger:{level:'info',stream:{write:(l:string)=>{lines.push(l);}}}});cleanup.push(()=>{void app.close();});
   registerGmailBackend(app,{publicUrl:'https://bridge.test',limits:{maxCallsInRequest:20}} as any,{allowedEmails:new Set([email]),writeEnabled:true,composeEnabled:true,...(configured?{push:PUSH}:{})} as any,store,{} as any,()=>mail);
   const auth={authorization:'Basic '+Buffer.from(email+':'+store.issuePassword(email)).toString('base64')};
   const session=(await app.inject({method:'GET',url:'/jmap/session',headers:auth})).json();
   expect(session.eventSourceUrl).toBe(configured?'https://bridge.test/jmap/eventsource?types={types}&closeafter={closeafter}&ping={ping}':undefined);
   const unauth=await app.inject({method:'POST',url:'/gmail/push?token='+TOKEN,payload:{}});expect(unauth.statusCode).toBe(configured?204:404);
+  expect(lines.join('')).not.toContain(TOKEN); // the token must never reach request logs
   if(!configured){const es=await app.inject({method:'GET',url:'/jmap/eventsource',headers:auth});expect(es.statusCode).toBe(404);}
   await app.close();
  }

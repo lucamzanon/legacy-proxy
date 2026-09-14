@@ -41,8 +41,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     hooks.push = push;
     push.start();
     app.addHook("onClose", async () => push?.stop());
-    app.post("/gmail/push", { config: { rawBody: false } }, async (req, reply) => push!.receive(req, reply));
   }
+  // The shared secret travels in the query string (Pub/Sub cannot set headers): never let request logging capture it, configured or not.
+  app.post("/gmail/push", { logLevel: "silent" }, async (req, reply) => push ? push.receive(req, reply) : reply.code(404).send({ error: "not found" }));
   const authenticated = new WeakMap<object, { email: string; mail: GmailMail; uploadType?: string }>();
   app.addHook("onRequest", async (req, reply) => {
     const path = req.url.split("?")[0]!;
