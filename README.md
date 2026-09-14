@@ -269,7 +269,7 @@ your own access token.
 ### Experimental Gmail API connection
 
 This opt-in backend exposes Gmail labels, messages, threads and downloads over
-JMAP using the Gmail API and read-only OAuth consent. The existing `gmail` IMAP
+JMAP using the Gmail API, with read-only consent by default. The existing `gmail` IMAP
 provider remains available separately. This is an experimental compatibility
 backend, not a complete RFC 8621 implementation.
 
@@ -336,9 +336,39 @@ Google tokens stay on the server. Removing the email from the allowlist and
 restarting also blocks access, including to cached data.
 
 Expose `/jmap`, `/jmap/*` and `/.well-known/jmap` alongside the OAuth routes at
-the HTTPS reverse proxy. Account and mailbox rights are read-only: writes and
-uploads fail, and submission/push capabilities are not advertised. Clients poll
+the HTTPS reverse proxy. Account and mailbox rights stay read-only unless both
+the operator enables writes and the account grants modify consent. Uploads and
+submission/push capabilities remain unavailable. Clients poll
 for changes; a changed state requires a full client refresh (`cannotCalculateChanges`).
+
+To enable mail management, add `https://www.googleapis.com/auth/gmail.modify`
+to the Google consent configuration and set `GMAIL_WRITE_ENABLED=true`. Restart,
+then reconnect through `/auth/google/start` and grant the requested permission.
+The existing bridge password and account ID remain valid; reload the mail client
+so it receives the new session rights. Setting the flag false disables writes
+again without changing the password. Old or incomplete grants remain read-only.
+
+Supported updates: `$seen`, `$flagged`, `$important`, mailbox membership for Inbox,
+Spam, Trash and user labels; create/rename/delete flat user labels. Full keyword
+maps and per-key JSON Pointer patches work. Unsupported custom keywords, draft
+changes, nested label parents, uploads, mail creation, sending and permanent mail
+deletion are rejected. Label deletion never deletes messages: nonempty labels
+require `onDestroyRemoveEmails=true` to remove their membership from messages.
+
+In management mode, All mail has the `archive` role for client interoperability.
+Moving a message to All mail removes Inbox/Spam/Trash while retaining its user
+labels. The All mail view still contains every message, including Inbox and
+Trash. Other full mailbox replacements replace writable folder memberships;
+keyword-backed/system memberships remain managed by their corresponding fields.
+The server returns normalized `mailboxIds`/`keywords` after an update.
+
+Writes are serialized per account and limited to 20 objects per set call. Each
+patch is validated before sending one Gmail modify request per message. Set
+responses report partial failures by ID. Ambiguous writes are not automatically
+retried (including label creation); refresh before manually retrying. Successful
+and uncertain writes invalidate caches and advance a persistent local revision;
+reads started before invalidation cannot repopulate those cache entries. External
+Gmail updates still use the polling/full-refresh behavior described below.
 
 Ordinary newest-first folder pages use exact label/profile counts and fetch only
 the required ID pages. Searches, oldest-first ordering, anchors and collapsed

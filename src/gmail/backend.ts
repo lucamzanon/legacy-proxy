@@ -12,7 +12,7 @@ import { GmailMail } from "./mail.js";
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyInstance<RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression, L>, cfg: AppConfig, google: GmailConfig,
   store: GmailStore, connection: GmailConnection,
-  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store)): void {
+  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false)): void {
   const accounts = new Map<string, GmailMail>();
   const authenticated = new WeakMap<object, { email: string; mail: GmailMail }>();
   app.addHook("onRequest", async (req, reply) => {
@@ -41,12 +41,13 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     if (!selected) return;
     const { email, mail } = selected;
     const path = req.url.split("?")[0]!;
-    const sessionState = "gmail-readonly-v1";
+    const writable=await mail.writable();
+    const sessionState = writable ? "gmail-manage-v1" : "gmail-readonly-v1";
     if (req.method === "GET" && path === "/jmap/session") {
       const mailProps = { maxMailboxesPerEmail: null, maxMailboxDepth: 1, maxSizeMailboxName: 1000,
-        maxSizeAttachmentsPerEmail: 50_000_000, emailQuerySortOptions: ["receivedAt"], mayCreateTopLevelMailbox: false };
-      return reply.send({ capabilities: { [CORE_CAPABILITY]: { ...coreCapabilityProps(cfg), maxObjectsInGet: 100 }, [MAIL_CAPABILITY]: {} },
-        accounts: { [mail.accountId]: { name: email, isPersonal: true, isReadOnly: true, accountCapabilities: { [MAIL_CAPABILITY]: mailProps } } },
+        maxSizeAttachmentsPerEmail: 50_000_000, emailQuerySortOptions: ["receivedAt"], mayCreateTopLevelMailbox: writable };
+      return reply.send({ capabilities: { [CORE_CAPABILITY]: { ...coreCapabilityProps(cfg), maxObjectsInGet: 100, maxObjectsInSet: 20 }, [MAIL_CAPABILITY]: {} },
+        accounts: { [mail.accountId]: { name: email, isPersonal: true, isReadOnly: !writable, accountCapabilities: { [MAIL_CAPABILITY]: mailProps } } },
         primaryAccounts: { [MAIL_CAPABILITY]: mail.accountId }, username: email,
         apiUrl: `${cfg.publicUrl}/jmap`, downloadUrl: `${cfg.publicUrl}/jmap/download/{accountId}/{blobId}/{type}/{name}`,
         uploadUrl: `${cfg.publicUrl}/jmap/upload/{accountId}`, state: sessionState });

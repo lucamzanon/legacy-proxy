@@ -1,6 +1,6 @@
 import { OAuth2Client, CodeChallengeMethod, type Credentials as GoogleCredentials, type GenerateAuthUrlOpts } from "google-auth-library";
 import type { Credentials } from "../auth/credentials.js";
-import { GMAIL_READONLY, type GmailConfig } from "./config.js";
+import { GMAIL_READONLY, GMAIL_MODIFY, type GmailConfig } from "./config.js";
 import { GmailStore, type GmailSnapshot, type GmailProfile, type GmailLabel } from "./store.js";
 
 // A narrow, injectable boundary keeps tests independent of Google and credentials.
@@ -11,7 +11,8 @@ export interface GoogleClient {
   setCredentials(credentials: GoogleCredentials): void;
   credentials: GoogleCredentials;
   getAccessToken(): Promise<unknown>;
-  request<T>(options: { url: string; timeout: number; retry: boolean }): Promise<{ data: T }>;
+  getTokenInfo?(token: string): Promise<{ scopes: string[] }>;
+  request<T>(options: { url: string; timeout: number; retry: boolean; method?: "GET" | "POST" | "PATCH" | "DELETE"; data?: unknown }): Promise<{ data: T }>;
 }
 export type GoogleClientFactory = () => GoogleClient;
 
@@ -31,7 +32,7 @@ export class GmailConnection {
     return {
       verifier: codeVerifier,
       url: client.generateAuthUrl({
-        access_type: "offline", prompt: "consent", scope: [GMAIL_READONLY],
+        access_type: "offline", prompt: "consent", scope: [this.config.writeEnabled ? GMAIL_MODIFY : GMAIL_READONLY],
         state, code_challenge: codeChallenge, code_challenge_method: CodeChallengeMethod.S256,
         redirect_uri: this.config.redirectUri,
       }),
@@ -60,12 +61,16 @@ export class GmailConnection {
   async connect(code: string, verifier: string): Promise<void> {
     const client = this.createClient();
     const { tokens } = await client.getToken({ code, codeVerifier: verifier, redirect_uri: this.config.redirectUri });
-    if (tokens.scope && !tokens.scope.split(" ").includes(GMAIL_READONLY)) throw new Error("Read permission was not granted");
+    const scopes = tokens.scope?.split(" ") ?? (tokens.access_token && client.getTokenInfo
+      ? (await client.getTokenInfo(tokens.access_token)).scopes : []);
+    if (this.config.writeEnabled ? !scopes.includes(GMAIL_MODIFY) : tokens.scope && !scopes.includes(GMAIL_READONLY) && !scopes.includes(GMAIL_MODIFY))
+      throw new Error("Required permission was not granted");
     client.setCredentials(tokens);
     const snapshot = await this.snapshot(client);
     const email = snapshot.profile.emailAddress.toLowerCase();
     // Avoid replacing a working connection with a grant without a refresh token.
-    await this.store.save(email, this.credentials(client, email), snapshot);
+    await this.store.save(email, { ...this.credentials(client, email), scopes }, snapshot);
+    this.store.invalidate(email);
   }
   /** Refreshes expired access tokens and persists their replacements across restarts. */
   refreshSnapshot(email: string): Promise<GmailSnapshot> {
@@ -86,7 +91,7 @@ export class GmailConnection {
     await client.getAccessToken();
     const snapshot = await this.snapshot(client);
     if (snapshot.profile.emailAddress.toLowerCase() !== email) throw new Error("Account mismatch");
-    await this.store.save(email, this.credentials(client, email), snapshot);
+    await this.store.updateCredentials(email, { ...this.credentials(client, email), scopes: saved.credentials.scopes }, saved.credentials.refreshToken, snapshot);
     return snapshot;
   }
 }

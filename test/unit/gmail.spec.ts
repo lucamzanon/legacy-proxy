@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import Fastify from "fastify";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { GMAIL_READONLY, loadGmailConfig, type GmailConfig } from "../../src/gmail/config.js";
+import { GMAIL_READONLY, GMAIL_MODIFY, loadGmailConfig, type GmailConfig } from "../../src/gmail/config.js";
 import { GmailStore } from "../../src/gmail/store.js";
 import { GmailConnection, type GoogleClient } from "../../src/gmail/connection.js";
 import { registerGmailRoutes } from "../../src/gmail/routes.js";
@@ -192,4 +192,27 @@ describe("Gmail opt-in config", () => {
     expect(() => loadGmailConfig("http://public.example")).toThrow("HTTPS");
     expect(loadGmailConfig("http://localhost:8080")?.secureCookies).toBe(false);
   });
+});
+
+it("requests modify consent only when enabled and preserves it through refresh",async()=>{
+ const store=database();const client=fakeGoogle();const configWrite={...config,writeEnabled:true};
+ vi.mocked(client.getToken).mockResolvedValue({tokens:{access_token:"new",refresh_token:"refresh",scope:GMAIL_MODIFY}});
+ const connection=new GmailConnection(configWrite,store,()=>client);await connection.authorization("state");
+ expect(client.generateAuthUrl).toHaveBeenCalledWith(expect.objectContaining({scope:[GMAIL_MODIFY]}));
+ await connection.connect("code","verifier");expect((await store.load("test@gmail.com"))!.credentials.scopes).toEqual([GMAIL_MODIFY]);
+ const password=store.issuePassword("test@gmail.com");await connection.refreshSnapshot("test@gmail.com");
+ expect((await store.load("test@gmail.com"))!.credentials.scopes).toEqual([GMAIL_MODIFY]);expect(store.authenticate(password)).toBe("test@gmail.com");
+});
+it("refuses incomplete modify consent without overwriting the working grant",async()=>{
+ const store=database();const client=fakeGoogle();await new GmailConnection(config,store,()=>client).connect("code","verifier");
+ const before=await store.load("test@gmail.com");
+ await expect(new GmailConnection({...config,writeEnabled:true},store,()=>client).connect("code","verifier")).rejects.toThrow("permission");
+ expect(await store.load("test@gmail.com")).toEqual(before);
+});
+it("verifies missing scope metadata before enabling modifications",async()=>{
+ const store=database();const client=fakeGoogle();vi.mocked(client.getToken).mockResolvedValue({tokens:{access_token:"new",refresh_token:"refresh"}});
+ const connection=new GmailConnection({...config,writeEnabled:true},store,()=>client);
+ await expect(connection.connect("code","verifier")).rejects.toThrow("permission");
+ client.getTokenInfo=vi.fn(async()=>({scopes:[GMAIL_MODIFY]}));await connection.connect("code","verifier");
+ expect(client.getTokenInfo).toHaveBeenCalledWith("new");expect((await store.load("test@gmail.com"))!.credentials.scopes).toEqual([GMAIL_MODIFY]);
 });

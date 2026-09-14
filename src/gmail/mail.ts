@@ -1,3 +1,5 @@
+import { GMAIL_MODIFY } from "./config.js";
+import { emailPatch, labelInput, writableLabel } from "./write.js";
 import crypto from "node:crypto";
 import { GmailApi } from "./api.js";
 import { GmailStore, type GmailProfile, type GmailLabel } from "./store.js";
@@ -15,23 +17,28 @@ const MAX_BLOB = 50_000_000;
 
 export class GmailMail {
   readonly accountId: string;
+  private writeTail: Promise<unknown> = Promise.resolve();
+  private queuedWrites = 0;
   private flights = new Map<string, Promise<unknown>>();
-  constructor(private email: string, private api: Pick<GmailApi, "get">, private store: GmailStore) {
+  constructor(private email: string, private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>, private store: GmailStore, private writeEnabled = false) {
     this.accountId = gmailAccountId(email);
   }
   private async cached<T>(key: string, ttl: number, fetch: () => Promise<T>): Promise<T> {
     const cached = this.store.cached<T>(this.email, key);
     if (cached !== null) return cached;
-    const pending = this.flights.get(key);
+    const revision=this.store.revision(this.email);
+    const flightKey=`${revision}:${key}`;
+    const pending = this.flights.get(flightKey);
     if (pending) return pending as Promise<T>;
     if (this.flights.size >= 100) throw new JmapError("serverUnavailable", "Too many concurrent Gmail reads");
-    const task = fetch().then((data) => { this.store.cache(this.email,key,data,ttl); return data; })
-      .finally(() => this.flights.delete(key));
-    this.flights.set(key, task);
+    const task = fetch().then((data) => { if(this.store.revision(this.email)===revision)this.store.cache(this.email,key,data,ttl); return data; })
+      .finally(() => this.flights.delete(flightKey));
+    this.flights.set(flightKey, task);
     return task;
   }
   profile(): Promise<GmailProfile> { return this.cached("profile", 30_000, () => this.api.get<GmailProfile>("profile", 1)); }
-  async state(): Promise<string> { return "g" + (await this.profile()).historyId; }
+  async writable(): Promise<boolean> { return this.writeEnabled && !!(await this.store.load(this.email))?.credentials.scopes?.includes(GMAIL_MODIFY); }
+  async state(): Promise<string> { const history=(await this.profile()).historyId;const revision=this.store.revision(this.email);return "g"+history+(revision?"r"+revision:""); }
   async mailboxState(): Promise<string> { return hash(await this.mailboxes()); }
   async labels(): Promise<GmailLabel[]> {
     const state = await this.state();
@@ -70,17 +77,17 @@ export class GmailMail {
     return result;
   }
   async mailboxes(): Promise<Record<string, unknown>[]> {
-    const [labels, profile] = await Promise.all([this.labels(), this.profile()]);
+    const [labels, profile, writable] = await Promise.all([this.labels(), this.profile(), this.writable()]);
     const unread = labels.find((label) => label.id === "UNREAD");
     const all: GmailLabel = { id: ALL_MAIL, name: "All mail", type: "system", messagesTotal: profile.messagesTotal,
       messagesUnread: unread?.messagesTotal ?? 0, threadsTotal: profile.threadsTotal, threadsUnread: unread?.threadsTotal ?? 0 };
     return [all, ...labels].map((label) => ({
       id: label.id === ALL_MAIL ? ALL_MAIL : "l_" + label.id,
-      name: label.name, parentId: null, role: label.id === ALL_MAIL ? "all" : ROLES[label.id] ?? null,
+      name: label.name, parentId: null, role: label.id === ALL_MAIL ? (writable ? "archive" : "all") : ROLES[label.id] ?? null,
       sortOrder: label.id === "INBOX" ? 0 : 10, totalEmails: label.messagesTotal ?? 0, unreadEmails: label.messagesUnread ?? 0,
       totalThreads: label.threadsTotal ?? 0, unreadThreads: label.threadsUnread ?? 0, isSubscribed: true,
-      myRights: { mayReadItems: true, mayAddItems: false, mayRemoveItems: false, maySetSeen: false, maySetKeywords: false,
-        mayCreateChild: false, mayRename: false, mayDelete: false, maySubmit: false },
+      myRights: { mayReadItems: true, mayAddItems: writable && (label.id===ALL_MAIL||writableLabel(label)), mayRemoveItems: writable && label.id!==ALL_MAIL && writableLabel(label), maySetSeen: writable, maySetKeywords: writable,
+        mayCreateChild: false, mayRename: writable && label.type==="user", mayDelete: writable && label.type==="user", maySubmit: false },
     }));
   }
   async message(id: string): Promise<GmailMessage> {
@@ -196,6 +203,78 @@ export class GmailMail {
       ...(args.calculateTotal === true ? { total: ids.length } : {}),
       ...((limit as number) > MAX_QUERY ? { limit: MAX_QUERY } : {}) };
   }
+  private set(kind: "Email"|"Mailbox", args: Record<string,unknown>): Promise<unknown> {
+    this.account(args);
+    if(this.queuedWrites>=10)throw new JmapError("serverUnavailable","Too many pending updates");
+    this.queuedWrites++;
+    const task=this.writeTail.then(()=>this.applySet(kind,args));
+    this.writeTail=task.catch(()=>{});
+    return task.finally(()=>{this.queuedWrites--;});
+  }
+  private async applySet(kind: "Email"|"Mailbox", a: Record<string,unknown>): Promise<unknown> {
+    if(!await this.writable()||!this.api.mutate)throw new JmapError("accountReadOnly");
+    const records=(v:unknown):Record<string,unknown>=>{
+      if(v==null)return {};if(typeof v!=="object"||Array.isArray(v))throw invalidArguments("Invalid set object");return v as Record<string,unknown>;
+    };
+    const create=records(a.create),update=records(a.update),destroy=a.destroy??[];
+    if(!Array.isArray(destroy)||destroy.some(id=>typeof id!=="string"))throw invalidArguments("Invalid destroy IDs");
+    if(Object.keys(create).length+Object.keys(update).length+destroy.length>20)throw new JmapError("requestTooLarge");
+    const oldState=kind==="Email"?await this.state():await this.mailboxState();
+    if(a.ifInState!=null&&a.ifInState!==oldState)throw new JmapError("stateMismatch");
+    if(a.onDestroyRemoveEmails!==undefined&&typeof a.onDestroyRemoveEmails!=="boolean")throw invalidArguments("Invalid onDestroyRemoveEmails");
+    const created:Record<string,unknown>=Object.create(null),updated:Record<string,unknown>=Object.create(null);
+    const notCreated:Record<string,unknown>=Object.create(null),notUpdated:Record<string,unknown>=Object.create(null),notDestroyed:Record<string,unknown>=Object.create(null);
+    const destroyed:string[]=[];
+    const error=(e:unknown)=>e instanceof JmapError?e.toMethodError():{type:"serverFail",description:"Gmail update failed"};
+    const mutate=async<T>(resource:string,cost:number,method:"POST"|"PATCH"|"DELETE",data?:unknown):Promise<T>=>{
+      this.store.invalidate(this.email);
+      try{return await this.api.mutate!<T>(resource,cost,method,data);}
+      finally{this.store.invalidate(this.email);}
+    };
+    // Fresh label metadata validates membership and prevents editing system labels.
+    let labels=await this.labels();
+    for(const [id,input]of Object.entries(create)){
+      try{
+        if(kind==="Email")throw new JmapError("forbidden","Creating mail is not supported");
+        const label=await mutate<GmailLabel>("labels",5,"POST",labelInput(input,true));
+        labels=[...labels,label];created[id]={id:"l_"+label.id,parentId:null,role:null,isSubscribed:true};
+      }catch(e){notCreated[id]=error(e);}
+    }
+    for(const [id,patch]of Object.entries(update)){
+      try{
+        if(kind==="Mailbox"){
+          const label=labels.find(l=>"l_"+l.id===id);
+          if(!label)throw new JmapError("notFound");if(label.type!=="user")throw new JmapError("forbidden","System labels are read-only");
+          const result=await mutate<GmailLabel>(`labels/${encodeURIComponent(label.id)}`,5,"PATCH",labelInput(patch,false));
+          labels=labels.map(l=>l.id===label.id?{...l,...result}:l);updated[id]=null;
+        }else{
+          if(!/^m_[A-Za-z0-9_-]{1,128}$/.test(id))throw new JmapError("notFound");
+          // Read current labels directly: cached metadata may predate a change in Gmail.
+          const message=await this.api.get<GmailMessage>(`messages/${encodeURIComponent(upstreamId(id,"m_"))}`,20,{format:"minimal"});
+          const delta=emailPatch(message,patch,labels);
+          const result=delta.addLabelIds.length||delta.removeLabelIds.length
+            ?await mutate<GmailMessage>(`messages/${encodeURIComponent(message.id)}/modify`,5,"POST",delta):message;
+          const mapped=await mapMessage({...result,internalDate:result.internalDate??"0"},{properties:["mailboxIds","keywords"]},async()=>Buffer.alloc(0));
+          updated[id]={mailboxIds:mapped.mailboxIds,keywords:mapped.keywords};
+        }
+      }catch(e){notUpdated[id]=error(e);}
+    }
+    for(const id of destroy){
+      try{
+        if(kind==="Email")throw new JmapError("forbidden","Permanent deletion is disabled; move to Trash instead");
+        const label=labels.find(l=>"l_"+l.id===id);
+        if(!label)throw new JmapError("notFound");if(label.type!=="user")throw new JmapError("forbidden","System labels are read-only");
+        const detail=await this.api.get<GmailLabel>(`labels/${encodeURIComponent(label.id)}`,1);
+        if((detail.messagesTotal??0)>0&&a.onDestroyRemoveEmails!==true)throw new JmapError("mailboxHasEmail");
+        await mutate(`labels/${encodeURIComponent(label.id)}`,5,"DELETE");destroyed.push(id);labels=labels.filter(l=>l.id!==label.id);
+      }catch(e){notDestroyed[id]=error(e);}
+    }
+    // Never hide successful writes if the follow-up profile read is temporarily unavailable.
+    let newState:string;
+    try{newState=kind==="Email"?await this.state():await this.mailboxState();}
+    catch{newState="w"+this.store.revision(this.email);}
+    return {accountId:this.accountId,oldState,newState,created,updated,destroyed,notCreated,notUpdated,notDestroyed};
+  }
   methods(): MethodTable {
     const changes = async (a: Record<string,unknown>) => {
       this.account(a); const state = await this.state();
@@ -254,7 +333,7 @@ export class GmailMail {
       },
       "Email/changes":changes,"Mailbox/changes":async(a)=>{this.account(a);const state=await this.mailboxState();if(a.sinceState!==state)throw new JmapError("cannotCalculateChanges");return {accountId:this.accountId,oldState:state,newState:state,hasMoreChanges:false,created:[],updated:[],destroyed:[]};},"Thread/changes":changes,
       "Email/queryChanges":async(a)=>{this.account(a);throw new JmapError("cannotCalculateChanges");},
-      "Mailbox/set":readOnly,"Email/set":readOnly,"Email/import":readOnly,"Email/copy":readOnly,
+      "Mailbox/set":(a)=>this.set("Mailbox",a),"Email/set":(a)=>this.set("Email",a),"Email/import":readOnly,"Email/copy":readOnly,
       "SearchSnippet/get":async(a)=>{this.account(a);return {accountId:this.accountId,list:[],notFound:a.emailIds??[]};},
     };
   }
