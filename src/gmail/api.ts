@@ -70,7 +70,9 @@ export class GmailApi {
           const reason = response?.data?.error?.errors?.[0]?.reason;
           const rateLimited = status === 429 || status === 403 &&
             (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded");
-          const temporary = rateLimited || status !== undefined && [500,502,503,504].includes(status);
+          const code=(error as {code?:string;cause?:{code?:string}}).code??(error as {cause?:{code?:string}}).cause?.code;
+          const networkFailure=code!==undefined&&['ECONNRESET','ETIMEDOUT','EAI_AGAIN','ENOTFOUND','ECONNREFUSED'].includes(code);
+          const temporary = networkFailure || rateLimited || status !== undefined && [500,502,503,504].includes(status);
           if (method) {
             if (status === 404) throw new JmapError("notFound");
             if (status === 400) throw new JmapError("invalidProperties", "Google rejected the update");
@@ -94,6 +96,8 @@ export class GmailApi {
       if (error instanceof JmapError) throw error;
       const status = (error as { response?: { status?: number } }).response?.status;
       if (status === 404) throw new JmapError("notFound");
+      const reason=(error as {response?:{data?:{error?:unknown}}}).response?.data?.error;
+      if(status===401||reason==='invalid_grant')throw new JmapError("serverUnavailable","Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.");
       // Library errors may contain Authorization headers: never pass them to the dispatcher.
       throw new JmapError("serverUnavailable", "Gmail request failed; reconnect if authorization expired");
     } finally {

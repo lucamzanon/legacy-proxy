@@ -71,20 +71,33 @@ export class GmailCompose {
    if(p.subParts){for(const child of list(p.subParts))await visit(child,depth+1);return;}
    if(p.partId && values[p.partId]){const v=values[p.partId];if(typeof obj(v).value!=='string')fail("invalidProperties","Missing body value");total+=Buffer.byteLength(obj(v).value as string);}
    else if(p.blobId){
-    if(!blobs.has(p.blobId)){let data;try{data=await this.c.download(p.blobId);}catch{fail("blobNotFound","Attachment is unavailable");}blobs.set(p.blobId,{body:data!.body,ctype:data!.type});}
+    if(!blobs.has(p.blobId)){let data;try{data=await this.c.download(p.blobId);}catch(e){if(e instanceof JmapError&&e.type!=="notFound")throw e;fail("blobNotFound","Attachment is unavailable; reattach the file. The previous draft is retained.");}blobs.set(p.blobId,{body:data!.body,ctype:data!.type});}
     total+=blobs.get(p.blobId)!.body.length;
    }else fail("invalidProperties","Body part has no content");
    if(total>MAX_RAW)fail("tooLarge","Message exceeds the compose limit");
   };
   await visit(create.bodyStructure!,0);
   const raw=await buildRfc822(create,this.c.email.split('@')[1]!,id=>blobs.get(id)??null,true);
-  if(raw.length>MAX_RAW)fail("tooLarge","Encoded message exceeds the compose limit");return raw;
+  if(raw.length>MAX_RAW)fail("tooLarge","Message exceeds the 25 MB encoded size limit. Reduce attachments (18 MB total recommended) or shorten the body. The previous draft is retained.");return raw;
  }
  async create(input:Record<string,unknown>):Promise<Record<string,unknown>>{
-  await this.check();this.placement(input);return this.createRaw(await this.rawFromCreate(input));
+  await this.check();this.placement(input);return this.createRaw(await this.rawFromCreate(input),input);
  }
- private async createRaw(raw:Buffer):Promise<Record<string,unknown>>{
-  const draft=await this.mutate<Draft>('drafts',10,'POST',{message:{raw:raw.toString('base64url')}});
+ private async createRaw(raw:Buffer,input?:Record<string,unknown>):Promise<Record<string,unknown>>{
+  let threadId:string|undefined;
+  const parent=(input?.inReplyTo as string[]|undefined)?.at(-1);
+  if(parent){
+   const q='in:anywhere rfc822msgid:"'+parent.replace(/\\/g,'\\\\').replace(/"/g,'\\"')+'"';
+   const found=await this.c.api.get<{messages?:{id:string;threadId:string}[]}>('messages',5,{q,maxResults:'2',includeSpamTrash:'true'});
+   const candidate=found.messages?.[0];
+   if(candidate){
+    const original=await this.c.api.get<GmailMessage>('messages/'+encodeURIComponent(candidate.id),20,{format:'metadata'});
+    const header=(name:string)=>original.payload?.headers?.find(h=>h.name?.toLowerCase()===name)?.value??'';
+    const subject=(value:string)=>value.replace(/^(?:re:\s*)+/i,'').trim();
+    if(header('message-id').replace(/^<|>$/g,'')===parent&&subject(header('subject'))===subject(String(input?.subject??'')))threadId=candidate.threadId;
+   }
+  }
+  const draft=await this.mutate<Draft>('drafts',10,'POST',{message:{raw:raw.toString('base64url'),...(threadId?{threadId}:{})}});
   this.c.store.rememberDraft(this.c.email,draft.message.id,draft.id);
   return {id:'m_'+draft.message.id,threadId:'t_'+draft.message.threadId,size:raw.length,mailboxIds:{all:true,l_DRAFT:true},keywords:{$draft:true,$seen:true}};
  }
@@ -135,7 +148,7 @@ export class GmailCompose {
   }
   if(!this.c.store.beginSubmission(this.c.email,original,fingerprint))fail('serverFail','Submission already in progress');
   // Persist the intent before crossing the network. An unknown outcome is never replayed.
-  const sent=await this.mutate<GmailMessage>('drafts/send',100,'POST',{id:draft.id});
+  const sent=await this.mutate<GmailMessage>('drafts/send',100,'POST',{id:draft.id}).catch(()=>fail('serverFail','Send outcome is uncertain. Check Sent before sending again; the bridge will not automatically retry this draft.'));
   const result={id:this.c.store.submission(this.c.email,original)!.id,emailId:'m_'+original,identityId:p.identityId,threadId:'t_'+sent.threadId,envelope,sendAt:new Date().toISOString(),undoStatus:'final',deliveryStatus:null,dsnBlobIds:[],mdnBlobIds:[]};
   this.c.store.finishSubmission(this.c.email,original,result,sent.id);return result;
  }

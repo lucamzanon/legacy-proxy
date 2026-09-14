@@ -28,6 +28,8 @@ export class GmailStore {
     this.db = new Database(file);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS gmail_cursor (email TEXT PRIMARY KEY, history TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS gmail_mailbox_snapshot (email TEXT NOT NULL,state TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(email,state));
       CREATE TABLE IF NOT EXISTS gmail_upload (email TEXT NOT NULL,id TEXT NOT NULL,body BLOB NOT NULL,type TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(email,id));
       CREATE TABLE IF NOT EXISTS gmail_draft (email TEXT NOT NULL,original TEXT NOT NULL,current TEXT NOT NULL,draft TEXT NOT NULL,PRIMARY KEY(email,original));
       CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
@@ -93,6 +95,27 @@ export class GmailStore {
       this.db.prepare("INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1").run(email);
       this.db.prepare("DELETE FROM gmail_cache WHERE email=?").run(email);
     })();
+  }
+  cursor(email:string):string|null {return (this.db.prepare("SELECT history FROM gmail_cursor WHERE email=?").get(email) as {history:string}|undefined)?.history??null;}
+  checkpoint(email:string,history:string,messages:string[],threads:string[],reset=false):void {
+    this.db.transaction(()=>{
+      const previous=this.cursor(email);if(previous&&BigInt(previous)>=BigInt(history))return;
+      if(reset)this.invalidate(email);
+      else if(messages.length||threads.length){
+        this.db.prepare("INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1").run(email);
+        this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND (key LIKE 'page:%' OR key LIKE 'query:%' OR key LIKE 'labels:%')").run(email);
+        const del=this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?");
+        for(const id of messages)del.run(email,'message:v2:'+id);
+        for(const id of threads)del.run(email,'thread:v2:t_'+id);
+      }
+      this.db.prepare("INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history").run(email,history);
+    })();
+  }
+  mailboxSnapshot(email:string,state:string,value?:Record<string,string>):Record<string,string>|null {
+    if(value){this.db.prepare("INSERT OR IGNORE INTO gmail_mailbox_snapshot VALUES(?,?,?)").run(email,state,JSON.stringify(value));
+      this.db.prepare("DELETE FROM gmail_mailbox_snapshot WHERE email=? AND rowid NOT IN (SELECT rowid FROM gmail_mailbox_snapshot WHERE email=? ORDER BY rowid DESC LIMIT 32)").run(email,email);}
+    const row=this.db.prepare("SELECT value FROM gmail_mailbox_snapshot WHERE email=? AND state=?").get(email,state) as {value:string}|undefined;
+    return row?JSON.parse(row.value):null;
   }
   cached<T>(email: string, key: string): T | null {
     const row = this.db.prepare("SELECT value FROM gmail_cache WHERE email=? AND key=? AND expires>?")
