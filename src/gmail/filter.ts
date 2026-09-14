@@ -13,6 +13,7 @@ const SYSTEM: Record<string, string> = {
   IMPORTANT: "is:important",
   CHAT: "is:chat",
 };
+const NOTHING = "in:anywhere -in:anywhere";
 const keyword = (value: unknown) => {
   if (value === "$seen") return "-is:unread";
   if (value === "$flagged") return "is:starred";
@@ -21,12 +22,22 @@ const keyword = (value: unknown) => {
   if (typeof value !== "string" || !value || Buffer.byteLength(value) > 255 || /[\x00-\x20\x7f]/.test(value))
     throw invalidArguments("Invalid keyword");
   // Gmail has no arbitrary JMAP keywords: absent keywords match no messages.
-  return "in:anywhere -in:anywhere";
+  return NOTHING;
 };
 function phrase(value: unknown): string {
   if (typeof value !== "string" || !value || /[\r\n\x00]/.test(value))
     throw invalidArguments("Expected a search string");
   return '"' + value.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+/** Free text matches every word (Gmail ANDs terms); a "quoted phrase" in the input stays a phrase. */
+function words(value: unknown): string {
+  if (typeof value !== "string" || /[\r\n\x00]/.test(value))
+    throw invalidArguments("Expected a search string");
+  const terms = (value.match(/"[^"]*"|[^\s"]+/g) ?? [])
+    .map((t) => t.replace(/^"|"$/g, "").trim())
+    .filter(Boolean);
+  if (!terms.length) throw invalidArguments("Expected a search string");
+  return terms.map(phrase).join(" ");
 }
 /** Gmail search is token based. Unknown JMAP conditions are explicitly rejected. */
 export function gmailFilter(filter: unknown, labels: GmailLabel[], depth = 0): string {
@@ -53,7 +64,7 @@ export function gmailFilter(filter: unknown, labels: GmailLabel[], depth = 0): s
       throw invalidArguments("Invalid filter operator");
     const clauses = f.conditions.map((c) => gmailFilter(c, labels, depth + 1));
     // Gmail has no literal true/false. Convert these to universal/impossible searches.
-    const expressions = clauses.map((c) => c || "{in:anywhere -in:anywhere}");
+    const expressions = clauses.map((c) => c || `{${NOTHING}}`);
     if (f.operator === "OR") return "{" + expressions.map((c) => `(${c})`).join(" ") + "}";
     if (f.operator === "NOT") return expressions.map((c) => `-(${c})`).join(" ");
     return clauses
@@ -64,10 +75,18 @@ export function gmailFilter(filter: unknown, labels: GmailLabel[], depth = 0): s
   const clauses: string[] = [];
   for (const [key, value] of Object.entries(f)) {
     if (key === "inMailbox") clauses.push(mailbox(value));
-    else if (key === "hasKeyword") clauses.push(keyword(value));
+    else if (key === "inMailboxOtherThan") {
+      if (!Array.isArray(value)) throw invalidArguments("inMailboxOtherThan must be an array of mailbox ids");
+      // Every message is also in the synthetic All mail, which would make this match everything. Clients use
+      // it to leave out Trash/Junk, so treat it as "in none of these"; excluding All mail excludes everything.
+      for (const id of value) {
+        const clause = mailbox(id);
+        clauses.push(clause ? `-(${clause})` : NOTHING);
+      }
+    } else if (key === "hasKeyword") clauses.push(keyword(value));
     else if (key === "notKeyword") clauses.push(`-(${keyword(value)})`);
     else if (["from", "to", "cc", "bcc", "subject"].includes(key)) clauses.push(`${key}:${phrase(value)}`);
-    else if (key === "text") clauses.push(phrase(value));
+    else if (key === "text") clauses.push(words(value));
     else if (key === "hasAttachment" && typeof value === "boolean")
       clauses.push(value ? "has:attachment" : "-has:attachment");
     else if (key === "after" || key === "before") {

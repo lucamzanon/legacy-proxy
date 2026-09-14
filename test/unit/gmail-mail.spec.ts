@@ -150,6 +150,25 @@ it("filters only supported Gmail searches", () => {
   expect(() => gmailFilter({ unsupported: true }, labels)).toThrow();
   expect(() => gmailFilter({ subject: "test\nquery" }, labels)).toThrow();
 });
+it("matches every word of a free-text search and excludes mailboxes", () => {
+  const boxes = [
+    ...labels,
+    { id: "TRASH", name: "TRASH", type: "system" },
+    { id: "SPAM", name: "SPAM", type: "system" },
+  ];
+  expect(gmailFilter({ text: 'quarterly  report "exact phrase"' }, boxes)).toBe(
+    '"quarterly" "report" "exact phrase"',
+  );
+  expect(
+    gmailFilter(
+      { operator: "AND", conditions: [{ text: "x" }, { inMailboxOtherThan: ["l_TRASH", "l_SPAM"] }] },
+      boxes,
+    ),
+  ).toBe('("x") (-(in:trash) -(in:spam))');
+  expect(gmailFilter({ inMailboxOtherThan: ["all"] }, boxes)).toBe("in:anywhere -in:anywhere");
+  expect(() => gmailFilter({ text: "  " }, boxes)).toThrow();
+  expect(() => gmailFilter({ inMailboxOtherThan: "l_TRASH" }, boxes)).toThrow();
+});
 it("rotates bridge passwords and intercepts Gmail requests without legacy fallback", async () => {
   const { store, mail } = setup();
   await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
@@ -308,12 +327,10 @@ it.each([429, 503, "rateLimitExceeded"])(
 it("does not retry permanent Google permission errors", async () => {
   const { store } = setup();
   await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
-  const request = vi
-    .fn()
-    .mockRejectedValue({
-      message: "SECRET",
-      response: { status: 403, data: { error: { errors: [{ reason: "domainPolicy" }] } } },
-    });
+  const request = vi.fn().mockRejectedValue({
+    message: "SECRET",
+    response: { status: 403, data: { error: { errors: [{ reason: "domainPolicy" }] } } },
+  });
   const client: any = {
     credentials: {},
     setCredentials(c: any) {
