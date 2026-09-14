@@ -273,15 +273,34 @@ JMAP using the Gmail API, with read-only consent by default. The existing `gmail
 provider remains available separately. This is an experimental compatibility
 backend, not a complete RFC 8621 implementation.
 
-Create a Google **Web application** OAuth client, enable Gmail API, and add
-`https://www.googleapis.com/auth/gmail.readonly` to its data access settings.
-For personal Gmail development, use an External application in Testing and add
-the Gmail address as a test user. Register this exact redirect URI, replacing
-the origin with the proxy's `PUBLIC_URL`:
+#### Google Cloud setup (done once per deployment)
 
-```text
-https://bridge.example.com/auth/google/callback
-```
+Nothing in this repository is tied to a particular Google project: every operator
+brings their own OAuth client, and Google's rules for that client decide who can
+connect and for how long. In the [Google Cloud console](https://console.cloud.google.com/):
+
+1. Create a project and enable the **Gmail API** (and **Pub/Sub** if you want push,
+   see below).
+2. Configure the **OAuth consent screen** with the scope you intend to use:
+   `https://www.googleapis.com/auth/gmail.readonly` for read-only, or
+   `https://www.googleapis.com/auth/gmail.modify` for management and composition.
+   Both are *restricted* scopes in Google's classification.
+3. Choose the **user type** and **publishing status** deliberately:
+   - **Internal** (Google Workspace organisations only): anyone in the organisation
+     can connect, no verification, tokens do not expire. The best option when the
+     proxy serves one company.
+   - **External, Testing**: only addresses listed as *test users* (max 100) can
+     connect, and Google **expires refresh tokens after 7 days**: every account must
+     be reconnected weekly. Fine for a first try, not for daily use.
+   - **External, In production** (press *Publish app*; no verification request
+     needed): refresh tokens no longer expire, users see Google's "unverified app"
+     warning once and continue via *Advanced*, and the app is capped at 100 users.
+     This is the practical setting for personal and small self-hosted deployments.
+   - Google's **app verification** (security assessment for restricted scopes) is
+     only required to remove the warning or exceed 100 users, i.e. to run a public
+     service.
+4. Create an OAuth client of type **Web application** and register this exact
+   redirect URI, replacing the origin with the proxy's `PUBLIC_URL`:
 
 Store the downloaded client JSON outside the repository, readable only by the
 service account. Configure the proxy:
@@ -456,6 +475,31 @@ sender. Submission/get exposes the most recent 100 successful bridge submissions
 no incremental submission changes are implemented. Submitted/uncertain draft IDs
 cannot subsequently be discarded through the draft-delete path.
 
+### Incremental sync and recovery
+
+The Gmail backend reads `users.history.list` when the observed profile history
+advances. It commits the cursor only after all pages have been read, invalidates
+changed message/thread caches, and retains unchanged message bodies and attachment
+bytes. The cursor is stored in SQLite and survives process restarts. Google history
+expiry triggers cache reset and on-demand reload of the currently viewed mail;
+there is no full-account body download. History work is bounded to 100 pages / 50,000
+records; larger gaps use the same reload path.
+
+`Email/changes` returns coalesced created/updated/destroyed IDs, including stable
+sent-draft aliases. `Mailbox/changes` compares the last 32 persisted snapshots,
+including counts and label renames. Unknown/expired states or changes exceeding the
+caller's `maxChanges` return `cannotCalculateChanges`; the client reloads the current
+view. `Thread/changes` and `Email/queryChanges` still fall back to requery. Without
+push configured (see below), sync is triggered by client requests/polling (profile
+cache up to 30 seconds). Direct bridge writes still invalidate the account cache conservatively.
+
+Transient read network errors receive bounded retries; writes never automatically
+retry. Revoked/expired grants return a sanitized reconnect instruction, without
+exposing Google tokens or upstream errors. Uncertain sends explicitly instruct the
+user to check Sent and leave the durable submission intent in place across restarts.
+Reply composition resolves the parent Message-ID in the same account and supplies
+Gmail's native thread ID only when the parent header and normalized subject match.
+
 ### Push notifications (Cloud Pub/Sub)
 
 Set `GMAIL_PUSH_TOPIC=projects/<project>/topics/<topic>` and a random
@@ -595,28 +639,3 @@ alone does not enable a provider. The existing `gmail` provider still uses IMAP.
 ## License
 
 AGPL-3.0
-
-### Incremental sync and recovery
-
-The Gmail bridge now reads `users.history.list` when the observed profile history
-advances. It commits the cursor only after all pages have been read, invalidates
-changed message/thread caches, and retains unchanged message bodies and attachment
-bytes. The cursor is stored in SQLite and survives process restarts. Google history
-expiry triggers cache reset and on-demand reload of the currently viewed mail;
-there is no full-account body download. History work is bounded to 100 pages / 50,000
-records; larger gaps use the same reload path.
-
-`Email/changes` returns coalesced created/updated/destroyed IDs, including stable
-sent-draft aliases. `Mailbox/changes` compares the last 32 persisted snapshots,
-including counts and label renames. Unknown/expired states or changes exceeding the
-caller's `maxChanges` return `cannotCalculateChanges`; the client reloads the current
-view. `Thread/changes` and `Email/queryChanges` still fall back to requery. Sync is
-triggered by client requests/polling (profile cache up to 30 seconds), not background
-push. Direct bridge writes still invalidate the account cache conservatively.
-
-Transient read network errors receive bounded retries; writes never automatically
-retry. Revoked/expired grants return a sanitized reconnect instruction, without
-exposing Google tokens or upstream errors. Uncertain sends explicitly instruct the
-user to check Sent and leave the durable submission intent in place across restarts.
-Reply composition resolves the parent Message-ID in the same account and supplies
-Gmail's native thread ID only when the parent header and normalized subject match.
