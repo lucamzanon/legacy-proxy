@@ -491,3 +491,15 @@ describe("self-service bridge password", () => {
     }
   });
 });
+
+describe("allowlist", () => {
+  it("accepts exact addresses and whole @domains, case-insensitively", async () => {
+    const { AllowList } = await import("../../src/gmail/config.js");
+    const list = new AllowList([" One@Example.test ", "@Corp.example", "", "@", "bad", "@x@y"]);
+    expect(list.size).toBe(2);
+    for (const ok of ["one@example.test", "ONE@example.test", "anyone@corp.example", "Other@CORP.example"])
+      expect(list.has(ok)).toBe(true);
+    for (const no of ["two@example.test", "anyone@notcorp.example", "corp.example", "@corp.example", "x@y"])
+      expect(list.has(no)).toBe(false);
+  });
+});

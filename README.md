@@ -315,7 +315,9 @@ GMAIL_OAUTH_CLIENT_FILE=/etc/legacy-proxy/google-oauth.json
 GMAIL_ALLOWED_EMAILS=tester@gmail.com
 ```
 
-`GMAIL_ALLOWED_EMAILS` is a required comma-separated allowlist. The Gmail profile
+`GMAIL_ALLOWED_EMAILS` is a required comma-separated allowlist of addresses and/or
+whole domains written as `@example.com` (for instance
+`GMAIL_ALLOWED_EMAILS=@example.com,someone@gmail.com`). The Gmail profile
 returned by Google determines whether the account is allowed; form values and
 login hints are not trusted. Visit `/auth/google/start` and click **Connect Gmail**.
 The flow uses PKCE, a browser-bound HttpOnly cookie, and single-use state expiring

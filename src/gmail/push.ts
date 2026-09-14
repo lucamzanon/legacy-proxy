@@ -30,7 +30,7 @@ export class GmailPush {
   constructor(
     private readonly store: GmailStore,
     private readonly account: (email: string) => GmailMail,
-    private readonly allowed: ReadonlySet<string>,
+    private readonly allowed: { has(email: string): boolean },
     private readonly config: { topic: string; token?: string; audience?: string; serviceAccount?: string },
     private readonly log: FastifyBaseLogger,
     private readonly verifier: IdTokenVerifier = new OAuth2Client(),
