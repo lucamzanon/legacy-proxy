@@ -102,7 +102,9 @@ describe("Gmail connection", () => {
     const saved = await database(dir).load("test@gmail.com");
     expect(saved?.credentials.refreshToken).toBe("REFRESH-SECRET");
     expect(saved?.snapshot.profile.historyId).toBe("12345678901234567890");
-    expect(fs.statSync(path.join(dir, "gmail.sqlite3")).mode & 0o777).toBe(0o600);
+    // NTFS has no POSIX permission bits; Node reports 0o666 there.
+    if (process.platform !== "win32")
+      expect(fs.statSync(path.join(dir, "gmail.sqlite3")).mode & 0o777).toBe(0o600);
   });
   it("rejects a different Google account before fetching labels or saving tokens", async () => {
     const store = database();
