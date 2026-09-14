@@ -30,6 +30,24 @@ export class GmailMail {
       enabled:()=>this.canCompose(),state:()=>this.state(),download:id=>this.download(id),exclusive:work=>this.exclusive(work),
       ...(aliasesEnabled?{sendAs:(fresh:boolean)=>this.sendAs(fresh)}:{}),...(schedule?{schedule}:{})});
   }
+  /** Push/recovery entry point: refresh the profile and run the incremental engine; true when client-visible state moved. */
+  async pushSync():Promise<boolean>{
+    const before=this.store.revision(this.email)+":"+(this.store.cursor(this.email)??"");
+    const fresh=await this.api.get<GmailProfile>("profile",1);
+    this.store.cache(this.email,"profile",fresh,30_000);
+    await this.profile();
+    return before!==this.store.revision(this.email)+":"+(this.store.cursor(this.email)??"");
+  }
+  /** Current per-type states for a StateChange event. */
+  async states():Promise<Record<string,string>>{ const email=await this.state();return {Email:email,Thread:email,Mailbox:await this.mailboxState()}; }
+  /** users.watch: Gmail publishes to the topic for at most 7 days; renew daily. */
+  async watch(topic:string):Promise<{expiration:number;history:string}>{
+    if(!this.api.mutate)throw new JmapError("accountReadOnly");
+    const r=await this.api.mutate<{historyId?:string;expiration?:string}>("watch",100,"POST",{topicName:topic,labelFilterBehavior:"INCLUDE"});
+    const expiration=Number(r.expiration);const history=String(r.historyId??"");
+    if(!Number.isFinite(expiration)||!/^\d+$/.test(history))throw new JmapError("serverFail","Unexpected watch response");
+    this.store.watchSave(this.email,expiration,history);return {expiration,history};
+  }
   /** Worker entry point: sends due scheduled submissions under the account write lock. */
   runScheduled(now=Date.now()):Promise<void>{return this.exclusive(()=>this.composer.runDue(now));}
   private async cached<T>(key: string, ttl: number, fetch: () => Promise<T>): Promise<T> {

@@ -448,6 +448,29 @@ sender. Submission/get exposes the most recent 100 successful bridge submissions
 no incremental submission changes are implemented. Submitted/uncertain draft IDs
 cannot subsequently be discarded through the draft-delete path.
 
+### Push notifications (Cloud Pub/Sub)
+
+Set `GMAIL_PUSH_TOPIC=projects/<project>/topics/<topic>` and a random
+`GMAIL_PUSH_TOKEN` (24+ characters) to replace polling with Gmail push. One-time
+Google Cloud setup, in the project that owns the OAuth client: enable the Pub/Sub
+API, create the topic, grant `roles/pubsub.publisher` on it to
+`gmail-api-push@system.gserviceaccount.com`, and create a **push** subscription whose
+endpoint is `https://<PUBLIC_URL>/gmail/push?token=<GMAIL_PUSH_TOKEN>` (expose that
+path through your reverse proxy). The bridge then calls `users.watch` for every
+connected account at startup and re-issues it every 24 h (Google expires watches
+after 7 days); failures are counted and retried hourly.
+
+Each notification is authenticated by the token (constant-time compare), persisted
+before it is acknowledged, and coalesced per account (1.5 s) into one run of the
+existing incremental engine. Duplicates and out-of-order deliveries are harmless:
+the engine always starts from the persisted history cursor. With push configured
+the session advertises `eventSourceUrl`; `GET /jmap/eventsource` streams RFC 8620
+`StateChange` events (Email/Thread/Mailbox states) after a sync actually changed
+something, so open clients update without polling. Accounts with open streams are
+also re-synced every 5 minutes as a safety net for notifications Google delays or
+drops. `/healthz` reports watches, renewal failures, notification counts and open
+streams; addresses and message contents are never logged.
+
 Ordinary newest-first folder pages use exact label/profile counts and fetch only
 the required ID pages. Searches, oldest-first ordering, anchors and collapsed
 thread queries enumerate matching IDs before slicing, which can be slow on large

@@ -41,6 +41,8 @@ export class GmailStore {
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS gmail_schedule_due ON gmail_schedule(status,send_at);
+      CREATE TABLE IF NOT EXISTS gmail_watch (email TEXT PRIMARY KEY, expiration INTEGER NOT NULL, history TEXT NOT NULL, renewed_at INTEGER NOT NULL, failures INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS gmail_push (email TEXT PRIMARY KEY, history TEXT NOT NULL, received_at INTEGER NOT NULL, count INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS gmail_cache (
         email TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
@@ -68,6 +70,7 @@ export class GmailStore {
     if (!row) return null;
     return { credentials: await openCredentials(this.vaultKey, row.vault), snapshot: JSON.parse(row.snapshot) };
   }
+  connectedEmails(): string[] { return (this.db.prepare("SELECT email FROM gmail_connection ORDER BY email").all() as {email:string}[]).map(r=>r.email); }
   hasConnection(email: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM gmail_connection WHERE email=?").get(email);
   }
@@ -219,6 +222,23 @@ export class GmailStore {
     const stats:Record<ScheduleStatus,number>={pending:0,sending:0,sent:0,canceled:0,suspended:0,uncertain:0};
     for(const r of this.db.prepare("SELECT status,COUNT(*) AS n FROM gmail_schedule GROUP BY status").all() as {status:ScheduleStatus;n:number}[])stats[r.status]=r.n;
     return stats;
+  }
+  // ── Push (Cloud Pub/Sub) ──────────────────────────────────────────
+  watchSave(email:string,expiration:number,history:string):void { this.db.prepare("INSERT INTO gmail_watch(email,expiration,history,renewed_at,failures) VALUES(?,?,?,?,0) ON CONFLICT(email) DO UPDATE SET expiration=excluded.expiration,history=excluded.history,renewed_at=excluded.renewed_at,failures=0").run(email,expiration,history,Date.now()); }
+  watchFailed(email:string):void { this.db.prepare("INSERT INTO gmail_watch(email,expiration,history,renewed_at,failures) VALUES(?,0,'',0,1) ON CONFLICT(email) DO UPDATE SET failures=failures+1").run(email); }
+  watch(email:string):{expiration:number;history:string;renewedAt:number;failures:number}|null { const r=this.db.prepare("SELECT expiration,history,renewed_at AS renewedAt,failures FROM gmail_watch WHERE email=?").get(email) as {expiration:number;history:string;renewedAt:number;failures:number}|undefined;return r??null; }
+  /** Persisted before the notification is acknowledged, so a crash never loses the hint. Returns true when the history id is newer than the last one seen. */
+  pushRecord(email:string,history:string):boolean {
+    const prev=this.db.prepare("SELECT history FROM gmail_push WHERE email=?").get(email) as {history:string}|undefined;
+    const newer=!prev||BigInt(history)>BigInt(prev.history);
+    this.db.prepare("INSERT INTO gmail_push(email,history,received_at,count) VALUES(?,?,?,1) ON CONFLICT(email) DO UPDATE SET history=CASE WHEN ? THEN excluded.history ELSE history END,received_at=excluded.received_at,count=count+1").run(email,history,Date.now(),newer?1:0);
+    return newer;
+  }
+  pushStats():{watches:number;watchFailures:number;expiringSoon:number;notifications:number;lastNotificationAt:number|null} {
+    const now=Date.now();
+    const w=this.db.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(failures),0) AS f,COALESCE(SUM(CASE WHEN expiration<? THEN 1 ELSE 0 END),0) AS soon FROM gmail_watch WHERE expiration>0").get(now+2*86400_000) as {n:number;f:number;soon:number};
+    const p=this.db.prepare("SELECT COALESCE(SUM(count),0) AS n,MAX(received_at) AS last FROM gmail_push").get() as {n:number;last:number|null};
+    return {watches:w.n,watchFailures:w.f,expiringSoon:w.soon,notifications:p.n,lastNotificationAt:p.last};
   }
   close(): void { this.db.close(); }
 }

@@ -8,10 +8,12 @@ import { GmailStore } from "./store.js";
 import { GmailConnection } from "./connection.js";
 import { GmailApi } from "./api.js";
 import { GmailMail } from "./mail.js";
+import { GmailPush } from "./push.js";
 
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyInstance<RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression, L>, cfg: AppConfig, google: GmailConfig,
   store: GmailStore, connection: GmailConnection,
+  hooks: { push?: GmailPush } = {},
   makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false, google.composeEnabled ?? false, google.aliasesEnabled ?? false, google.schedule)): void {
   const accounts = new Map<string, GmailMail>();
   const account = (email: string) => { let mail = accounts.get(email); if (!mail) { mail = makeMail(email); accounts.set(email, mail); } return mail; };
@@ -33,6 +35,15 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     timer.unref();
     app.addHook("onClose", async () => clearInterval(timer));
   }
+  let push: GmailPush | undefined;
+  if (google.push) {
+    push = new GmailPush(store, account, google.allowedEmails, google.push, app.log);
+    hooks.push = push;
+    push.start();
+    app.addHook("onClose", async () => push?.stop());
+  }
+  // The shared secret travels in the query string (Pub/Sub cannot set headers): never let request logging capture it, configured or not.
+  app.post("/gmail/push", { logLevel: "silent" }, async (req, reply) => push ? push.receive(req, reply) : reply.code(404).send({ error: "not found" }));
   const authenticated = new WeakMap<object, { email: string; mail: GmailMail; uploadType?: string }>();
   app.addHook("onRequest", async (req, reply) => {
     const path = req.url.split("?")[0]!;
@@ -77,7 +88,19 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
         accounts: { [mail.accountId]: { name: email, isPersonal: true, isReadOnly: !writable, accountCapabilities: { [MAIL_CAPABILITY]: mailProps, ...extraCaps } } },
         primaryAccounts: { [MAIL_CAPABILITY]: mail.accountId, ...(canCompose?{[SUBMISSION_CAPABILITY]:mail.accountId}:{}) }, username: email,
         apiUrl: `${cfg.publicUrl}/jmap`, downloadUrl: `${cfg.publicUrl}/jmap/download/{accountId}/{blobId}/{type}/{name}`,
-        uploadUrl: `${cfg.publicUrl}/jmap/upload/{accountId}`, state: sessionState });
+        uploadUrl: `${cfg.publicUrl}/jmap/upload/{accountId}`, state: sessionState,
+        ...(push ? { eventSourceUrl: `${cfg.publicUrl}/jmap/eventsource?types={types}&closeafter={closeafter}&ping={ping}` } : {}) });
+    }
+    if (req.method === "GET" && path === "/jmap/eventsource") {
+      if (!push) return reply.code(404).send({ error: "not found" });
+      const q = req.query as { types?: string; closeafter?: string; ping?: string };
+      const rawTypes = q.types ?? "*";
+      const types = rawTypes === "*" || rawTypes === "" ? null : rawTypes.split(",").map((s) => s.trim()).filter(Boolean);
+      const pingRaw = Number(q.ping ?? 30);
+      const pingSec = Number.isFinite(pingRaw) ? Math.max(15, Math.min(pingRaw, 300)) : 30;
+      reply.hijack();
+      push.addStream(email, reply, (req.headers.origin as string | undefined) ?? null, { types, closeAfter: q.closeafter === "state", pingSec });
+      return;
     }
     if (req.method === "POST" && path === "/jmap") {
       const env = req.body as RequestEnvelope;
