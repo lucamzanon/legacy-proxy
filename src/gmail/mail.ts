@@ -365,6 +365,9 @@ export class GmailMail {
           : undefined;
       const total = label ? label.messagesTotal : (await this.profile()).messagesTotal;
       if (total !== undefined) {
+        // A folder page lists by label id: exact membership that matches the label's counts, with no
+        // dependence on search syntax, label names or search-index lag.
+        const listing: Record<string, string> = label ? { labelIds: label.id } : { q };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
         const refs = new Map<string, { id: string; threadId: string }>();
@@ -376,9 +379,9 @@ export class GmailMail {
             const page = await this.cached<{
               messages?: { id: string; threadId: string }[];
               nextPageToken?: string;
-            }>(`page:${state}:${hash(q)}:${hash(cursor)}`, 30 * 60_000, () =>
+            }>(`page:${state}:${hash(listing)}:${hash(cursor)}`, 30 * 60_000, () =>
               this.api.get("messages", 5, {
-                q,
+                ...listing,
                 includeSpamTrash: "true",
                 maxResults: "500",
                 ...(cursor ? { pageToken: cursor } : {}),

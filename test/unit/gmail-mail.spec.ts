@@ -271,6 +271,25 @@ it("opens a large folder without scanning every page", async () => {
   expect(get.mock.calls.filter((c) => c[0] === "messages")).toHaveLength(1);
 });
 
+it("lists a folder page by label id instead of a label-name search", async () => {
+  const { mail, store, get } = setup();
+  store.cache(
+    email,
+    "labels:g123",
+    [...labels, { id: "Label_1", name: "Work / Q&A (2026)", type: "user", messagesTotal: 2 }],
+    60_000,
+  );
+  const result = await mail.methods()["Email/query"]!({
+    accountId: mail.accountId,
+    filter: { inMailbox: "l_Label_1" },
+    limit: 2,
+    calculateTotal: true,
+  });
+  expect(result).toMatchObject({ ids: ["m_a", "m_b"], total: 2 });
+  const listing = get.mock.calls.find((c) => c[0] === "messages")!;
+  expect(listing[2]).toMatchObject({ labelIds: "Label_1", includeSpamTrash: "true" });
+  expect(listing[2]).not.toHaveProperty("q");
+});
 it("treats unmapped client keywords as absent", () => {
   expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe("in:anywhere -in:anywhere");
   expect(gmailFilter({ notKeyword: "$pinned" }, labels)).toBe("-(in:anywhere -in:anywhere)");
