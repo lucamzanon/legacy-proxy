@@ -13,15 +13,40 @@ const obj=(x:unknown):Record<string,unknown>=>x&&typeof x==="object"&&!Array.isA
 const line=(x:unknown):string=>typeof x==="string"&&!/[\r\n\x00]/.test(x)?x:fail("invalidProperties","Invalid header value");
 const address=(x:unknown):string=>{const s=line(x);if(!/^[^\s<>@,;]+@[^\s<>@,;]+$/.test(s))fail("invalidProperties","Invalid email address");return s;};
 interface Draft {id:string;message:GmailMessage & {raw?:string}}
+/** Subset of Gmail users.settings.sendAs. */
+export interface SendAs {sendAsEmail?:string;displayName?:string;replyToAddress?:string;isPrimary?:boolean;verificationStatus?:string}
+interface Identity {id:string;name:string;email:string;replyTo:{email:string}[]|null;bcc:null;textSignature:string;htmlSignature:string;mayDelete:false}
 interface ComposeContext {
  email:string;accountId:string;api:Pick<GmailApi,"get"|"mutate">;store:GmailStore;
  enabled:()=>Promise<boolean>;state:()=>Promise<string>;
  download:(id:string)=>Promise<{body:Buffer;type:string}>;
  exclusive:<T>(work:()=>Promise<T>)=>Promise<T>;
+ /** Absent when GMAIL_ALIASES_ENABLED is off: only the account address may send. */
+ sendAs?:(fresh:boolean)=>Promise<SendAs[]>;
 }
 /** Native Gmail drafts preserve Bcc and make an ambiguous send non-replayable. */
 export class GmailCompose {
  constructor(private c:ComposeContext){}
+ private primary():Identity{return {id:'gi_'+this.c.accountId,name:this.c.email,email:this.c.email,replyTo:null,bcc:null,textSignature:'',htmlSignature:'',mayDelete:false};}
+ /** Primary address plus verified aliases. Signatures stay client-side by design; Google signatures are never imported. */
+ async identities(fresh=false):Promise<Identity[]>{
+  const primary=this.primary();if(!this.c.sendAs)return [primary];
+  const list=await this.c.sendAs(fresh);const seen=new Set<string>([primary.email]);const result=[primary];
+  for(const entry of list){
+   const email=typeof entry.sendAsEmail==='string'?entry.sendAsEmail.trim().toLowerCase():'';
+   if(!/^[^\s<>@,;]+@[^\s<>@,;]+$/.test(email))continue;
+   const name=typeof entry.displayName==='string'&&!/[\r\n\x00]/.test(entry.displayName)&&entry.displayName.trim()?entry.displayName.trim():email;
+   const reply=typeof entry.replyToAddress==='string'?entry.replyToAddress.trim().toLowerCase():'';
+   const replyTo=/^[^\s<>@,;]+@[^\s<>@,;]+$/.test(reply)&&reply!==email?[{email:reply}]:null;
+   if(email===primary.email||entry.isPrimary===true){if(email===primary.email){primary.name=name;primary.replyTo=replyTo;}continue;}
+   // Pending or failed verification: Gmail would refuse the send, so never offer it.
+   if(entry.verificationStatus!=='accepted'||seen.has(email))continue;
+   seen.add(email);result.push({...primary,id:'gi_'+this.c.accountId+'_'+crypto.createHash('sha256').update(email).digest('hex').slice(0,16),name,email,replyTo});
+  }
+  return result;
+ }
+ /** Lower-case addresses allowed in From. Falls back to the primary address if Gmail settings are unreachable. */
+ private async senders():Promise<Set<string>>{const list=await this.identities().catch(()=>[this.primary()]);return new Set(list.map(i=>i.email));}
  private async check(a?:Record<string,unknown>){if(a&&a.accountId!==this.c.accountId)fail("accountNotFound","Wrong account");if(!await this.c.enabled())fail("accountReadOnly","Composition disabled");}
  private async mutate<T>(resource:string,cost:number,method:"POST"|"DELETE",data?:unknown):Promise<T>{
   this.c.store.invalidate(this.c.email);
@@ -40,9 +65,10 @@ export class GmailCompose {
    if(!Array.isArray(input[key])||(input[key] as unknown[]).length>500)fail("invalidProperties","Invalid address list");
    for(const v of input[key] as unknown[]){const a=obj(v);address(a.email);if(a.name!=null)line(a.name);}
   }
-  const from=input.from as {email:string}[]|undefined;
-  if(!from||from.length!==1||from[0]!.email.toLowerCase()!==this.c.email)fail("invalidProperties","From must match the account identity");
-  if(input.sender!=null){const sender=input.sender as {email:string}[];if(sender.length!==1||sender[0]!.email.toLowerCase()!==this.c.email)fail("invalidProperties","Sender must match the account");}
+  const from=input.from as {email:string}[]|undefined;const allowed=await this.senders();
+  const sender=from?.length===1?from[0]!.email.toLowerCase():'';
+  if(!allowed.has(sender))fail("invalidProperties","From must match the account address or a verified Gmail send-as alias");
+  const senderHeader=input.sender as {email:string}[]|undefined;if(senderHeader!=null&&(senderHeader.length!==1||senderHeader[0]!.email.toLowerCase()!==sender))fail("invalidProperties","Sender must match From");
   if(input.subject!=null)line(input.subject);
   for(const key of ['messageId','inReplyTo','references'])if(input[key]!=null){
    if(!Array.isArray(input[key]))fail("invalidProperties","Invalid message IDs");
@@ -125,25 +151,28 @@ export class GmailCompose {
   if(!m.labelIds?.includes('DRAFT'))fail("forbidden","Permanent mail deletion is disabled");
   const draft=await this.checkedDraft(original);await this.mutate('drafts/'+encodeURIComponent(draft.id),10,'DELETE');
  }
- private async recipients(raw:Buffer){
+ private async recipients(raw:Buffer,allowed:Set<string>){
   const parsed=await simpleParser(raw,{skipHtmlToText:true,skipTextToHtml:true});
   const collect=(v:typeof parsed.to)=>!v?[]:(Array.isArray(v)?v:[v]).flatMap(x=>x.value.map(a=>address(a.address)));
-  const from=collect(parsed.from);if(from.length!==1||from[0]!.toLowerCase()!==this.c.email)fail("invalidEmail","Draft sender does not match identity");
-  return {mailFrom:{email:this.c.email},rcptTo:[...new Set([...collect(parsed.to),...collect(parsed.cc),...collect(parsed.bcc)])].map(email=>({email}))};
+  const from=collect(parsed.from).map(a=>a.toLowerCase());if(from.length!==1||!allowed.has(from[0]!))fail("invalidEmail","Draft sender does not match an allowed identity");
+  return {mailFrom:{email:from[0]!},rcptTo:[...new Set([...collect(parsed.to),...collect(parsed.cc),...collect(parsed.bcc)])].map(email=>({email}))};
  }
  private async submitOne(input:unknown):Promise<Record<string,unknown>>{
   const p=obj(input);for(const k of Object.keys(p))if(!['emailId','identityId','envelope'].includes(k))fail('invalidProperties','Unsupported submission property');
-  if(p.identityId!=='gi_'+this.c.accountId)fail('invalidProperties','Unknown identity');
+  if(typeof p.identityId!=='string'||!p.identityId.startsWith('gi_'+this.c.accountId))fail('invalidProperties','Unknown identity');
   const original=upstreamId(p.emailId,'m_');
   const fingerprint=crypto.createHash('sha256').update(JSON.stringify(p)).digest('hex');
   const previous=this.c.store.submission(this.c.email,original);
   if(previous){if(previous.fingerprint!==fingerprint)fail('invalidProperties','Draft already submitted with different options');if(previous.result)return JSON.parse(previous.result);return fail('serverFail','Send outcome is uncertain; check Sent before attempting another send');}
+  // Re-read Gmail settings right before sending: an alias removed meanwhile must not be used, and the draft stays intact.
+  const identities=await this.identities(true).catch(e=>{if(e instanceof JmapError&&e.type!=='notFound')throw e;return fail('serverUnavailable','Could not verify the sending identity with Gmail; retry later. The draft is retained.');});
+  const identity=identities.find(i=>i.id===p.identityId)??fail('forbiddenFrom','The selected sender is no longer a verified Gmail send-as address; choose another identity. The draft is retained.');
   const draft=await this.checkedDraft(original,'raw');
   const raw=Buffer.from(draft.message.raw??'','base64url');if(!raw.length||raw.length>MAX_RAW)fail('invalidEmail','Invalid draft MIME');
-  const envelope=await this.recipients(raw);if(!envelope.rcptTo.length)fail('noRecipients','No recipients');if(envelope.rcptTo.length>500)fail('tooManyRecipients','Too many recipients');
+  const envelope=await this.recipients(raw,new Set([identity.email]));if(!envelope.rcptTo.length)fail('noRecipients','No recipients');if(envelope.rcptTo.length>500)fail('tooManyRecipients','Too many recipients');
   if(p.envelope!=null){
    const e=obj(p.envelope),from=obj(e.mailFrom);const rcpts=Array.isArray(e.rcptTo)?e.rcptTo.map(obj):fail('invalidProperties','Invalid envelope');
-   if(from.email!==this.c.email||Object.keys(obj(from.parameters??{})).length||rcpts.some(r=>Object.keys(obj(r.parameters??{})).length))fail('invalidProperties','Custom SMTP envelopes and extensions are unsupported');
+   if(typeof from.email!=='string'||from.email.toLowerCase()!==identity.email||Object.keys(obj(from.parameters??{})).length||rcpts.some(r=>Object.keys(obj(r.parameters??{})).length))fail('invalidProperties','Custom SMTP envelopes and extensions are unsupported');
    const actual=rcpts.map(r=>address(r.email).toLowerCase()).sort();const expected=envelope.rcptTo.map(r=>r.email.toLowerCase()).sort();if(JSON.stringify(actual)!==JSON.stringify(expected))fail('invalidProperties','Envelope must match draft recipients');
   }
   if(!this.c.store.beginSubmission(this.c.email,original,fingerprint))fail('serverFail','Submission already in progress');
@@ -180,13 +209,18 @@ export class GmailCompose {
    for(const k of Object.keys(p))if(!['blobId','mailboxIds','keywords','receivedAt'].includes(k))fail('invalidProperties','Unsupported import property');
    if(typeof p.blobId!=='string')fail('blobNotFound','Missing MIME blob');
    const data=await this.c.download(p.blobId as string);if(!data.body.length||data.body.length>MAX_RAW)fail('tooLarge','MIME import exceeds limit');
-   await this.recipients(data.body);created[key]=await this.createRaw(data.body);
+   await this.recipients(data.body,await this.senders());created[key]=await this.createRaw(data.body);
   }catch(e){notCreated[key]=e instanceof JmapError?e.toMethodError():{type:'invalidEmail'};}
   return {accountId:this.c.accountId,oldState,newState:await this.c.state().catch(()=>`w${this.c.store.revision(this.c.email)}`),created:Object.keys(created).length?created:null,notCreated:Object.keys(notCreated).length?notCreated:null};
  }
  methods():MethodTable{return {
   'Email/import':a=>this.c.exclusive(()=>this.importDrafts(a)),
-  'Identity/get':async a=>{await this.check(a);const record={id:'gi_'+this.c.accountId,name:this.c.email,email:this.c.email,replyTo:null,bcc:null,textSignature:'',htmlSignature:'',mayDelete:false};const ids=a.ids as string[]|null|undefined;return {accountId:this.c.accountId,state:'identity-v1',list:!ids||ids.includes(record.id)?[record]:[],notFound:(ids??[]).filter(id=>id!==record.id)};},
+  'Identity/get':async a=>{await this.check(a);
+   // Settings outages degrade to the primary address so composing keeps working; sending re-validates anyway.
+   const list=await this.identities().catch(()=>[this.primary()]);const ids=a.ids as string[]|null|undefined;
+   if(ids!=null&&(!Array.isArray(ids)||ids.length>100))fail('invalidArguments','Invalid ids');
+   const state='identity-'+crypto.createHash('sha256').update(JSON.stringify(list)).digest('hex').slice(0,16);
+   return {accountId:this.c.accountId,state,list:ids?list.filter(i=>ids.includes(i.id)):list,notFound:(ids??[]).filter(id=>!list.some(i=>i.id===id))};},
   'Identity/set':async a=>{await this.check(a);throw new JmapError('forbidden','Configure identities in Gmail');},
   'EmailSubmission/set':a=>this.c.exclusive(()=>this.submit(a)),
   'EmailSubmission/get':async a=>{await this.check(a);const all=this.c.store.submissionResults(this.c.email);const ids=a.ids as string[]|null|undefined;return {accountId:this.c.accountId,state:String(this.c.store.revision(this.c.email)),list:ids?all.filter(x=>ids.includes(x.id as string)):all,notFound:(ids??[]).filter(id=>!all.some(x=>x.id===id))};},

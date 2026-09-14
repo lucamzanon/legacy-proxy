@@ -1,5 +1,5 @@
 import { readHistory, affected, emailDelta } from './history.js';
-import { GmailCompose } from "./compose.js";
+import { GmailCompose, type SendAs } from "./compose.js";
 import { GMAIL_MODIFY } from "./config.js";
 import { emailPatch, labelInput, writableLabel } from "./write.js";
 import crypto from "node:crypto";
@@ -24,10 +24,11 @@ export class GmailMail {
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
   private flights = new Map<string, Promise<unknown>>();
-  constructor(private email: string, private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>, private store: GmailStore, private writeEnabled = false, private composeEnabled = false) {
+  constructor(private email: string, private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>, private store: GmailStore, private writeEnabled = false, private composeEnabled = false, private aliasesEnabled = false) {
     this.accountId = gmailAccountId(email);
     this.composer=new GmailCompose({email,accountId:this.accountId,api:api as Pick<GmailApi,"get"|"mutate">,store,
-      enabled:()=>this.canCompose(),state:()=>this.state(),download:id=>this.download(id),exclusive:work=>this.exclusive(work)});
+      enabled:()=>this.canCompose(),state:()=>this.state(),download:id=>this.download(id),exclusive:work=>this.exclusive(work),
+      ...(aliasesEnabled?{sendAs:(fresh:boolean)=>this.sendAs(fresh)}:{})});
   }
   private async cached<T>(key: string, ttl: number, fetch: () => Promise<T>): Promise<T> {
     const cached = this.store.cached<T>(this.email, key);
@@ -70,6 +71,12 @@ export class GmailMail {
   }
   async writable(): Promise<boolean> { return this.writeEnabled && !!(await this.store.load(this.email))?.credentials.scopes?.includes(GMAIL_MODIFY); }
   async canCompose():Promise<boolean>{return this.composeEnabled && await this.writable();}
+  /** Gmail "Send mail as" settings; readable with gmail.modify. A fresh read bypasses the cache before sending. */
+  private async sendAs(fresh:boolean):Promise<SendAs[]>{
+    const read=async()=>(await this.api.get<{sendAs?:SendAs[]}>("settings/sendAs",5)).sendAs??[];
+    if(!fresh)return this.cached("sendAs",300_000,read);
+    const list=await read();this.store.cache(this.email,"sendAs",list,300_000);return list;
+  }
   async upload(body:Buffer,type:string):Promise<string>{if(!await this.canCompose())throw new JmapError("accountReadOnly");try{return this.store.upload(this.email,body,type);}catch{throw new JmapError("tooLarge","Upload quota exceeded");}}
   async state(): Promise<string> { const history=(await this.profile()).historyId;const revision=this.store.revision(this.email);return "g"+history+(revision?"r"+revision:""); }
   async mailboxState(): Promise<string> {
