@@ -365,6 +365,8 @@ export class GmailCompose {
     if (!m.labelIds?.includes("DRAFT")) fail("forbidden", "Permanent mail deletion is disabled");
     const draft = await this.checkedDraft(original);
     await this.mutate("drafts/" + encodeURIComponent(draft.id), 10, "DELETE");
+    // Every autosave creates a draft; its id mapping is only needed while the message exists.
+    this.c.store.forgetDraft(this.c.email, original);
   }
   private async recipients(raw: Buffer, allowed: Set<string>) {
     const parsed = await simpleParser(raw, { skipHtmlToText: true, skipTextToHtml: true });

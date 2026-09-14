@@ -156,4 +156,26 @@ export class GmailConnection {
     );
     return snapshot;
   }
+  /** Revokes the Google grant (best effort) and deletes everything stored for the account. True when Google confirmed. */
+  async disconnect(email: string): Promise<boolean> {
+    email = email.toLowerCase();
+    const saved = await this.store.load(email);
+    const token = saved?.credentials.refreshToken ?? saved?.credentials.accessToken;
+    let revoked = false;
+    if (token) {
+      const client = this.createClient() as GoogleClient & {
+        revokeToken?: (token: string) => Promise<unknown>;
+      };
+      try {
+        if (client.revokeToken) {
+          await client.revokeToken(token);
+          revoked = true;
+        }
+      } catch {
+        // Already revoked or Google unreachable: the local data is deleted either way.
+      }
+    }
+    this.store.disconnect(email);
+    return revoked;
+  }
 }

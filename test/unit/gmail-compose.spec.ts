@@ -286,6 +286,13 @@ it("keeps a draft sendable when Google provably did not send it", async () => {
   expect(second.created.s.undoStatus).toBe("final");
   expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(2);
 });
+it("forgets the id mapping of a discarded draft", async () => {
+  const { save, mail, store } = await setup();
+  const draft = await save();
+  expect(store.draft(email, draft.id.slice(2))).not.toBeNull();
+  await mail.methods()["Email/set"]!({ accountId: mail.accountId, destroy: [draft.id] });
+  expect(store.draft(email, draft.id.slice(2))).toBeNull();
+});
 it("lets the client discard a draft whose send outcome is uncertain", async () => {
   const { save, mail, mutate, drafts } = await setup();
   const draft = await save();

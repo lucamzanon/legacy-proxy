@@ -317,6 +317,32 @@ export class GmailStore {
   upstreamId(email: string, original: string): string {
     return this.draft(email, original)?.current ?? original;
   }
+  /** Drops the id mapping of a discarded draft; sent drafts keep theirs so their JMAP id stays stable. */
+  forgetDraft(email: string, original: string): void {
+    this.db
+      .prepare("DELETE FROM gmail_draft WHERE email=? AND original=? AND current=original")
+      .run(email, original);
+  }
+  /** Deletes everything stored for an account: grant, bridge password, cache, drafts, send ledger and queues. */
+  disconnect(email: string): void {
+    const tables = [
+      "gmail_connection",
+      "gmail_password",
+      "gmail_cache",
+      "gmail_cursor",
+      "gmail_revision",
+      "gmail_mailbox_snapshot",
+      "gmail_upload",
+      "gmail_draft",
+      "gmail_submission",
+      "gmail_schedule",
+      "gmail_watch",
+      "gmail_push",
+    ];
+    this.db.transaction(() => {
+      for (const table of tables) this.db.prepare(`DELETE FROM ${table} WHERE email=?`).run(email);
+    })();
+  }
   beginSubmission(email: string, original: string, fingerprint: string): boolean {
     return (
       this.db
