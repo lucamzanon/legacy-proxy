@@ -7,6 +7,7 @@ import { GmailApi } from "./api.js";
 import { GmailStore, type GmailProfile, type GmailLabel } from "./store.js";
 import {
   ALL_MAIL,
+  HIDDEN_LABELS,
   upstreamId,
   mapMessage,
   partTree,
@@ -239,9 +240,23 @@ export class GmailMail {
       threadsTotal: profile.threadsTotal,
       threadsUnread: unread?.threadsTotal ?? 0,
     };
-    return [all, ...labels].map((label) => ({
+    // Gmail names system labels after their ids ("INBOX", "CATEGORY_SOCIAL").
+    const names: Record<string, string> = {
+      INBOX: "Inbox",
+      SENT: "Sent",
+      DRAFT: "Drafts",
+      SPAM: "Spam",
+      TRASH: "Trash",
+      CATEGORY_PERSONAL: "Personal",
+      CATEGORY_SOCIAL: "Social",
+      CATEGORY_PROMOTIONS: "Promotions",
+      CATEGORY_UPDATES: "Updates",
+      CATEGORY_FORUMS: "Forums",
+    };
+    const visible = labels.filter((label) => !HIDDEN_LABELS.has(label.id));
+    return [all, ...visible].map((label) => ({
       id: label.id === ALL_MAIL ? ALL_MAIL : "l_" + label.id,
-      name: label.name,
+      name: label.type === "system" && label.name === label.id ? (names[label.id] ?? label.name) : label.name,
       parentId: null,
       role: label.id === ALL_MAIL ? (writable ? "archive" : "all") : (ROLES[label.id] ?? null),
       sortOrder: label.id === "INBOX" ? 0 : 10,
@@ -249,7 +264,7 @@ export class GmailMail {
       unreadEmails: label.messagesUnread ?? 0,
       totalThreads: label.threadsTotal ?? 0,
       unreadThreads: label.threadsUnread ?? 0,
-      isSubscribed: true,
+      isSubscribed: (label as { labelListVisibility?: string }).labelListVisibility !== "labelHide",
       myRights: {
         mayReadItems: true,
         mayAddItems:

@@ -21,6 +21,8 @@ export interface GmailMessage {
   payload?: GmailPart;
 }
 export const ALL_MAIL = "all";
+/** Gmail labels that are states (read, starred, important) or another product (Chat), not places mail is filed. Keywords carry the states. */
+export const HIDDEN_LABELS: ReadonlySet<string> = new Set(["UNREAD", "STARRED", "IMPORTANT", "CHAT"]);
 export function upstreamId(id: unknown, prefix: string): string {
   if (
     typeof id !== "string" ||
@@ -134,7 +136,12 @@ export async function mapMessage(
     id: `m_${message.id}`,
     threadId: `t_${message.threadId}`,
     blobId: blobId(message.id, null),
-    mailboxIds: Object.fromEntries([ALL_MAIL, ...labels.map((id) => `l_${id}`)].map((id) => [id, true])),
+    mailboxIds: Object.fromEntries(
+      [ALL_MAIL, ...labels.filter((id) => !HIDDEN_LABELS.has(id)).map((id) => `l_${id}`)].map((id) => [
+        id,
+        true,
+      ]),
+    ),
     keywords,
     size: message.sizeEstimate ?? 0,
     receivedAt: new Date(Number(message.internalDate)).toISOString(),
