@@ -58,7 +58,8 @@ export class GmailConnection {
     return { mech: "XOAUTH2", username: email, accessToken: c.access_token ?? undefined,
       refreshToken: c.refresh_token, expiresAt: c.expiry_date ?? undefined };
   }
-  async connect(code: string, verifier: string): Promise<void> {
+  /** Exchanges the code, stores the grant and returns the connected address. */
+  async connect(code: string, verifier: string): Promise<string> {
     const client = this.createClient();
     const { tokens } = await client.getToken({ code, codeVerifier: verifier, redirect_uri: this.config.redirectUri });
     const scopes = tokens.scope?.split(" ") ?? (tokens.access_token && client.getTokenInfo
@@ -71,6 +72,7 @@ export class GmailConnection {
     // Avoid replacing a working connection with a grant without a refresh token.
     await this.store.save(email, { ...this.credentials(client, email), scopes }, snapshot);
     this.store.invalidate(email);
+    return email;
   }
   /** Refreshes expired access tokens and persists their replacements across restarts. */
   refreshSnapshot(email: string): Promise<GmailSnapshot> {

@@ -216,3 +216,43 @@ it("verifies missing scope metadata before enabling modifications",async()=>{
  client.getTokenInfo=vi.fn(async()=>({scopes:[GMAIL_MODIFY]}));await connection.connect("code","verifier");
  expect(client.getTokenInfo).toHaveBeenCalledWith("new");expect((await store.load("test@gmail.com"))!.credentials.scopes).toEqual([GMAIL_MODIFY]);
 });
+
+describe("self-service bridge password", () => {
+  it("issues and shows the bridge password exactly once after consent, only when requested", async () => {
+    const app = Fastify();
+    const issued: string[] = [];
+    const store = { issuePassword: vi.fn((email: string) => { const p = "gmap_" + email.length + "_" + issued.length; issued.push(p); return p; }) };
+    const connection = {
+      authorization: vi.fn(async (state: string) => ({ url: `https://accounts.google.com/o/oauth2/v2/auth?state=${state}`, verifier: "v" })),
+      connect: vi.fn(async () => "tester@gmail.com"),
+    };
+    await registerGmailRoutes(app, { config, connection, store });
+    try {
+      const form = (await app.inject("/auth/google/start")).body;
+      expect(form).toContain('name="issue"');
+      const run = async (payload: string) => {
+        const start = await app.inject({ method: "POST", url: "/auth/google/start", headers: { origin: config.origin, "content-type": "application/x-www-form-urlencoded" }, payload });
+        const state = new URL(String(start.headers.location)).searchParams.get("state");
+        const cookie = String(start.headers["set-cookie"]).split(";")[0]!;
+        const cb = await app.inject({ method: "GET", url: `/auth/google/callback?state=${state}&code=abc`, headers: { cookie } });
+        expect(cb.statusCode).toBe(303);
+        const cookies = ([] as string[]).concat(cb.headers["set-cookie"] as string | string[]).map((c) => c.split(";")[0]!);
+        const resultCookie = cookies.find((c) => c.startsWith("gmail_result=") && c.length > "gmail_result=".length);
+        const result = await app.inject({ method: "GET", url: "/auth/google/result?status=connected", headers: resultCookie ? { cookie: resultCookie } : {} });
+        return { result, resultCookie };
+      };
+      const without = await run("");
+      expect(store.issuePassword).not.toHaveBeenCalled();
+      expect(without.resultCookie).toBeUndefined();
+      expect(without.result.body).toContain("existing bridge password still works");
+      const with_ = await run("issue=1");
+      expect(store.issuePassword).toHaveBeenCalledWith("tester@gmail.com");
+      expect(with_.result.body).toContain(issued[0]);
+      expect(with_.result.body).toContain("tester@gmail.com");
+      expect(with_.result.body).toContain(config.origin);
+      // Second view with the same cookie: the secret is gone.
+      const again = await app.inject({ method: "GET", url: "/auth/google/result?status=connected", headers: { cookie: with_.resultCookie! } });
+      expect(again.body).not.toContain(issued[0]);
+    } finally { await app.close(); }
+  });
+});

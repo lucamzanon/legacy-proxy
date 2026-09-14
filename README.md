@@ -300,6 +300,14 @@ after ten minutes. Callback logs are suppressed and no tokens are returned to
 the browser. Restarting the service invalidates pending authorization flows;
 start again if this happens during consent.
 
+Self-service onboarding: the consent page at `/auth/google/start` has an "Issue a
+bridge password for Bulwark" checkbox (on by default). After a successful consent
+the result page shows server, username and a freshly issued bridge password exactly
+once, bound to that browser and expiring after two minutes; any previous bridge
+password for that account stops working. Untick the box to reconnect (for example
+after a revoked grant) while keeping the existing password. `npm run gmail:password`
+remains available for operators.
+
 Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
 The same database caches metadata, message bodies and attachment bytes in plaintext;
 protect `DATA_DIR` and its backups. Cached values expire and are bounded to 256 MiB
