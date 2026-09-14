@@ -455,7 +455,9 @@ export class GmailMail {
     return this.exclusive(() => this.applySet(kind, args));
   }
   private exclusive<T>(work: () => Promise<T>): Promise<T> {
-    if (this.queuedWrites >= 10) throw new JmapError("serverUnavailable", "Too many pending updates");
+    // Reject rather than throw: callers such as the schedule worker chain .catch() onto the result.
+    if (this.queuedWrites >= 10)
+      return Promise.reject(new JmapError("serverUnavailable", "Too many pending updates"));
     this.queuedWrites++;
     const task = this.writeTail.then(work);
     this.writeTail = task.catch(() => {});

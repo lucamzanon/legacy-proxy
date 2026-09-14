@@ -238,6 +238,19 @@ it("guards mutation in the API gateway and never retries ambiguous writes", asyn
   expect(request).toHaveBeenCalledTimes(1);
   expect((await store.load(email))!.credentials.scopes).toEqual([GMAIL_MODIFY]);
 });
+it("rejects instead of throwing when the account write queue is full", async () => {
+  const { mail } = await setup();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const blockers = Array.from({ length: 10 }, () => (mail as any).exclusive(() => gate));
+  let result: Promise<void> | undefined;
+  expect(() => {
+    result = mail.runScheduled();
+  }).not.toThrow();
+  await expect(result).rejects.toMatchObject({ type: "serverUnavailable" });
+  release();
+  await Promise.all(blockers);
+});
 it("marks writes Google never received or refused as safe to retry", async () => {
   const { store } = await setup();
   const { GmailNotSent } = await import("../../src/gmail/api.js");
