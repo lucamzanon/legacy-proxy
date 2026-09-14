@@ -60,8 +60,11 @@ export class GmailApi {
     try {
       const saved = await this.store.load(this.email);
       if (!saved) throw new JmapError("accountNotFound");
+      // users.watch/stop only manage push notifications and work with the read-only grant.
+      const pushOnly = method === "POST" && (resource === "watch" || resource === "stop");
       if (
         method &&
+        !pushOnly &&
         (!this.connection.config.writeEnabled || !saved.credentials.scopes?.includes(GMAIL_MODIFY))
       )
         throw new JmapError("accountReadOnly");

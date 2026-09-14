@@ -159,6 +159,43 @@ it("coalesces bursts into one sync and publishes a StateChange to open streams o
   expect(store.cursor(email)).toBe("12");
   expect(push.counters.changesPublished).toBe(1);
 });
+it("renews the watch with a read-only grant", async () => {
+  const { GmailApi } = await import("../../src/gmail/api.js");
+  const { GMAIL_READONLY } = await import("../../src/gmail/config.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-push-ro-"));
+  const store = new GmailStore(dir, crypto.randomBytes(32));
+  cleanup.push(() => {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "refresh", scopes: [GMAIL_READONLY] },
+    { profile: { emailAddress: email, historyId: "10", messagesTotal: 1, threadsTotal: 1 }, labels },
+  );
+  const request = vi.fn(async () => ({
+    data: { historyId: "10", expiration: String(Date.now() + 7 * 86400_000) },
+  }));
+  const client: any = {
+    credentials: {},
+    setCredentials(c: any) {
+      this.credentials = c;
+    },
+    getAccessToken: async () => {},
+    request,
+  };
+  const api = new GmailApi(
+    email,
+    { config: { writeEnabled: false }, createClient: () => client } as any,
+    store,
+  );
+  const mail = new GmailMail(email, api, store);
+  await expect(mail.watch(PUSH.topic)).resolves.toMatchObject({ history: "10" });
+  expect(request).toHaveBeenCalledTimes(1);
+  await expect(api.mutate("labels", 5, "POST", { name: "x" })).rejects.toMatchObject({
+    type: "accountReadOnly",
+  });
+});
 it("renews the watch daily, records failures and retries on the next check", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
   const { push, store, mutate, state, log } = await setup();
