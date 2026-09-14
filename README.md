@@ -325,6 +325,7 @@ is treated as a regression.
 ```
 src/
   server.ts        fastify bootstrap, auth, upload/download/eventsource routes
+  backends/        legacy transport bindings for authenticated JMAP requests
   jmap/            session, router, capabilities, errors, refs, eventsource hub
     methods/       per-type handlers (mailbox, email, threads, identity,
                    submission, vacation, contacts, push)
@@ -339,6 +340,18 @@ src/
   state/           SQLite store, opaque state strings, change log
   util/            config loader, pino log
 ```
+
+The JMAP dispatcher accepts a request-bound method table, a call limit, and
+an opaque session state. `backends/legacy.ts` binds the existing handlers to
+the authenticated account and its IMAP/SMTP/ManageSieve/CardDAV resources;
+`server.ts` selects that table for each request. The dispatcher owns result
+references, capability gates, mutation barriers, and response ordering without
+importing a mail transport or the account store.
+
+This is a method-dispatch boundary only. Login, session capabilities, blob
+routes, and IDLE are still wired to the legacy backend in `server.ts`. Adding
+another backend also requires adapting those entry points; a new method table
+alone does not enable a provider. The existing `gmail` provider still uses IMAP.
 
 ## License
 
