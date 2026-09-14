@@ -63,11 +63,12 @@ await app.register(cors, { origin: true });
 // reply.raw directly, bypassing the onSend hook this plugin uses.
 await app.register(compress, { global: true, threshold: 1024 });
 
-app.get("/healthz", async () => ({ ok: true }));
-
 const gmailConfig = loadGmailConfig(cfg.publicUrl);
-if (gmailConfig) {
-  const gmailStore = new GmailStore(cfg.dataDir, cfg.vaultKey);
+const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
+// Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
+app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}) }));
+
+if (gmailConfig && gmailStore) {
   const connection = new GmailConnection(gmailConfig, gmailStore);
   registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection);
   await app.register(registerGmailRoutes, { config: gmailConfig, connection });

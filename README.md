@@ -411,7 +411,37 @@ through a persisted mapping to Gmail's new message ID. Existing drafts edited
 outside the bridge are checked before sending/discarding to avoid acting on a
 replacement the client has not seen.
 
-Only immediate sends are supported (`maxDelayedSend=0`): no delayed send, undo,
+Set `GMAIL_SCHEDULE_ENABLED=true` to add a persistent delayed-send queue (RFC 4865
+FUTURERELEASE: `HOLDFOR` seconds or `HOLDUNTIL` timestamp in the envelope
+`mailFrom` parameters). The session then advertises `maxDelayedSend`
+(`GMAIL_MAX_DELAYED_SEND`, default 30 days) and `submissionExtensions.FUTURERELEASE`,
+which is what Bulwark's "schedule send" and "undo send" use. A held submission
+records account, identity, recipients, the draft's thread and a hash of the draft
+MIME in protected SQLite and answers `undoStatus: pending` with `sendAt`; nothing is
+sent to Google at that point and the draft stays a native Gmail draft. A worker
+(every 5 s) leases due entries atomically and, before calling `drafts.send`,
+re-checks composition, the identity (fresh send-as read), the draft's existence
+and hash, and the send ledger. A draft edited or deleted in the meantime, a removed
+identity, or an entry that comes due while the bridge is down for longer than
+`GMAIL_SCHEDULE_LATE_TOLERANCE` (default 900 s) is **suspended**, never sent: the
+submission becomes final with a per-recipient `deliveryStatus` explaining why and the
+draft remains in Drafts to be sent again by hand. Transient Google errors before the
+send call leave the entry pending for the next tick.
+
+`EmailSubmission/set` `update: {id: {undoStatus: "canceled"}}` cancels a pending
+entry atomically (`cannotUnsend` once it is being handed to Google or already
+final); `EmailSubmission/query` lists newest first. Bulwark's reschedule creates
+the replacement before cancelling the original, so several pending entries for one
+draft are allowed: the first to send wins and the others end up `canceled`
+(superseded). An unconfirmed `drafts.send` marks the entry uncertain (final,
+`delivered: unknown`) and blocks any further send of that draft, exactly like
+immediate sends. Entries found in `sending` after a restart are reconciled through
+the ledger (sent or uncertain). `onSuccessUpdateEmail` filing patches on a held
+submission answer `forbidden` in the implicit `Email/set`: Gmail files the message
+when it is actually sent. `/healthz` exposes per-status queue counters and nothing
+else.
+
+Without the flag, only immediate sends are supported (`maxDelayedSend=0`): no delayed send, undo,
 custom SMTP envelope recipients/sender, SMTP parameters, delivery reports or
 post-send deletion. Explicit envelopes must match the MIME recipients and account
 sender. Submission/get exposes the most recent 100 successful bridge submissions;

@@ -8,6 +8,8 @@ export interface GmailConfig {
   writeEnabled?: boolean;
   composeEnabled?: boolean;
   aliasesEnabled?: boolean;
+  /** Delayed send queue (FUTURERELEASE). Absent = immediate sends only. */
+  schedule?: { maxDelayedSend: number; lateTolerance: number };
   clientId: string;
   clientSecret: string;
   redirectUri: string;
@@ -15,6 +17,13 @@ export interface GmailConfig {
   allowedEmails: ReadonlySet<string>;
   secureCookies: boolean;
 }
+
+const positive = (value: string | undefined, fallback: number): number => {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n <= 0) throw new Error("Gmail schedule settings must be positive integers (seconds)");
+  return n;
+};
 
 /** Opt-in: absent credentials leave every existing legacy deployment unchanged. */
 export function loadGmailConfig(publicUrl: string): GmailConfig | null {
@@ -37,6 +46,9 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
     writeEnabled: process.env.GMAIL_WRITE_ENABLED === "true",
     composeEnabled: process.env.GMAIL_COMPOSE_ENABLED === "true",
     aliasesEnabled: process.env.GMAIL_ALIASES_ENABLED === "true",
+    ...(process.env.GMAIL_SCHEDULE_ENABLED === "true" ? { schedule: {
+      maxDelayedSend: positive(process.env.GMAIL_MAX_DELAYED_SEND, 30 * 86400),
+      lateTolerance: positive(process.env.GMAIL_SCHEDULE_LATE_TOLERANCE, 900) } } : {}),
     clientId: web.client_id, clientSecret: web.client_secret,
     origin: base.origin, redirectUri: `${base.origin}/auth/google/callback`,
     allowedEmails, secureCookies: base.protocol === "https:",

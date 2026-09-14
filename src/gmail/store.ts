@@ -35,6 +35,12 @@ export class GmailStore {
       CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
       CREATE TABLE IF NOT EXISTS gmail_submission (email TEXT NOT NULL,original TEXT NOT NULL,id TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT,PRIMARY KEY(email,original));
       CREATE TABLE IF NOT EXISTS gmail_revision (email TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS gmail_schedule (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL, original TEXT NOT NULL, identity TEXT NOT NULL, thread TEXT NOT NULL,
+        envelope TEXT NOT NULL, raw_hash TEXT NOT NULL, send_at INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS gmail_schedule_due ON gmail_schedule(status,send_at);
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS gmail_cache (
         email TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
@@ -177,7 +183,50 @@ export class GmailStore {
     })();
   }
   submissionResults(email:string):Record<string,unknown>[] {
-    return (this.db.prepare("SELECT result FROM gmail_submission WHERE email=? AND result IS NOT NULL ORDER BY rowid DESC LIMIT 100").all(email) as {result:string}[]).map(r=>JSON.parse(r.result));
+    return (this.db.prepare("SELECT result,fingerprint FROM gmail_submission WHERE email=? AND result IS NOT NULL ORDER BY rowid DESC LIMIT 100").all(email) as {result:string;fingerprint:string}[]).map(r=>({...JSON.parse(r.result),fingerprint:r.fingerprint}));
+  }
+  // ── Delayed send queue ────────────────────────────────────────────
+  scheduleCreate(row:Omit<ScheduleRow,"id"|"status"|"reason"|"createdAt"|"updatedAt">):ScheduleRow {
+    const now=Date.now();const full:ScheduleRow={...row,id:"gq_"+crypto.randomBytes(16).toString("hex"),status:"pending",reason:null,createdAt:now,updatedAt:now};
+    this.db.prepare("INSERT INTO gmail_schedule(id,email,original,identity,thread,envelope,raw_hash,send_at,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(full.id,full.email,full.original,full.identity,full.thread,JSON.stringify(full.envelope),full.rawHash,full.sendAt,full.status,null,now,now);
+    return full;
+  }
+  schedule(email:string,id:string):ScheduleRow|null { const row=this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? AND id=?").get(email,id) as RawSchedule|undefined;return row?fromRaw(row):null; }
+  schedules(email:string):ScheduleRow[] { return (this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? ORDER BY send_at DESC, rowid DESC LIMIT 500").all(email) as RawSchedule[]).map(fromRaw); }
+  /** Atomic: only a pending entry can be canceled. Returns the resulting state for error mapping. */
+  scheduleCancel(email:string,id:string):"done"|"missing"|ScheduleStatus {
+    const changes=this.db.prepare("UPDATE gmail_schedule SET status='canceled',reason='canceled by client',updated_at=? WHERE email=? AND id=? AND status='pending'").run(Date.now(),email,id).changes;
+    if(changes===1)return "done";
+    return this.schedule(email,id)?.status??"missing";
+  }
+  scheduleDueEmails(now:number):string[] { return (this.db.prepare("SELECT DISTINCT email FROM gmail_schedule WHERE status='pending' AND send_at<=?").all(now) as {email:string}[]).map(r=>r.email); }
+  scheduleDue(email:string,now:number):ScheduleRow[] { return (this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? AND status='pending' AND send_at<=? ORDER BY send_at").all(email,now) as RawSchedule[]).map(fromRaw); }
+  /** Atomic lease: exactly one worker moves an entry from pending to sending. */
+  scheduleLease(id:string):boolean { return this.db.prepare("UPDATE gmail_schedule SET status='sending',updated_at=? WHERE id=? AND status='pending'").run(Date.now(),id).changes===1; }
+  scheduleRelease(id:string):void { this.db.prepare("UPDATE gmail_schedule SET status='pending',updated_at=? WHERE id=? AND status='sending'").run(Date.now(),id); }
+  scheduleFinish(id:string,status:Exclude<ScheduleStatus,"pending"|"sending">,reason:string|null):void { this.db.prepare("UPDATE gmail_schedule SET status=?,reason=?,updated_at=? WHERE id=?").run(status,reason,Date.now(),id); }
+  /** A process that died mid-send leaves entries in `sending`; their outcome is known only through the send ledger. */
+  scheduleRecover():number {
+    const rows=this.db.prepare("SELECT * FROM gmail_schedule WHERE status='sending'").all() as RawSchedule[];
+    for(const row of rows){
+      const ledger=this.submission(row.email,row.original);
+      this.scheduleFinish(row.id,ledger?.result?"sent":"uncertain",ledger?.result?null:"process interrupted during send; check Sent");
+    }
+    return rows.length;
+  }
+  scheduleStats():Record<ScheduleStatus,number> {
+    const stats:Record<ScheduleStatus,number>={pending:0,sending:0,sent:0,canceled:0,suspended:0,uncertain:0};
+    for(const r of this.db.prepare("SELECT status,COUNT(*) AS n FROM gmail_schedule GROUP BY status").all() as {status:ScheduleStatus;n:number}[])stats[r.status]=r.n;
+    return stats;
   }
   close(): void { this.db.close(); }
 }
+export type ScheduleStatus="pending"|"sending"|"sent"|"canceled"|"suspended"|"uncertain";
+export interface ScheduleRow {
+  id:string;email:string;original:string;identity:string;thread:string;
+  envelope:{mailFrom:{email:string};rcptTo:{email:string}[]};rawHash:string;sendAt:number;
+  status:ScheduleStatus;reason:string|null;createdAt:number;updatedAt:number;
+}
+interface RawSchedule {id:string;email:string;original:string;identity:string;thread:string;envelope:string;raw_hash:string;send_at:number;status:ScheduleStatus;reason:string|null;created_at:number;updated_at:number}
+const fromRaw=(r:RawSchedule):ScheduleRow=>({id:r.id,email:r.email,original:r.original,identity:r.identity,thread:r.thread,envelope:JSON.parse(r.envelope),rawHash:r.raw_hash,sendAt:r.send_at,status:r.status,reason:r.reason,createdAt:r.created_at,updatedAt:r.updated_at});

@@ -12,8 +12,27 @@ import { GmailMail } from "./mail.js";
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyInstance<RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression, L>, cfg: AppConfig, google: GmailConfig,
   store: GmailStore, connection: GmailConnection,
-  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false, google.composeEnabled ?? false, google.aliasesEnabled ?? false)): void {
+  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false, google.composeEnabled ?? false, google.aliasesEnabled ?? false, google.schedule)): void {
   const accounts = new Map<string, GmailMail>();
+  const account = (email: string) => { let mail = accounts.get(email); if (!mail) { mail = makeMail(email); accounts.set(email, mail); } return mail; };
+  if (google.schedule) {
+    // Entries left in `sending` by a crash have an outcome known only through the ledger.
+    const recovered = store.scheduleRecover();
+    if (recovered) app.log.warn({ recovered }, "gmail scheduled sends interrupted by a previous shutdown were reconciled");
+    let running = false;
+    const tick = async () => {
+      if (running) return; running = true;
+      try {
+        for (const email of store.scheduleDueEmails(Date.now())) {
+          if (!google.allowedEmails.has(email) || !store.hasConnection(email)) continue;
+          await account(email).runScheduled().catch((err: unknown) => app.log.error({ err: err instanceof Error ? err.message : String(err) }, "gmail scheduled send worker failed"));
+        }
+      } finally { running = false; }
+    };
+    const timer = setInterval(() => { void tick(); }, 5_000);
+    timer.unref();
+    app.addHook("onClose", async () => clearInterval(timer));
+  }
   const authenticated = new WeakMap<object, { email: string; mail: GmailMail; uploadType?: string }>();
   app.addHook("onRequest", async (req, reply) => {
     const path = req.url.split("?")[0]!;
@@ -30,8 +49,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     if (!email || !google.allowedEmails.has(email) || !store.hasConnection(email)) {
       return reply.header("WWW-Authenticate", 'Basic realm="gmail-bridge"').code(401).send({ error: "unauthorized" });
     }
-    let mail = accounts.get(email);
-    if (!mail) { mail = makeMail(email); accounts.set(email, mail); }
+    const mail = account(email);
     authenticated.set(req, { email, mail });
     reply.header("Cache-Control", "no-store");
     if (path.startsWith("/jmap/upload/")) {
@@ -49,8 +67,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     const path = req.url.split("?")[0]!;
     const writable=await mail.writable();
     const canCompose=await mail.canCompose();
-    const extraCaps=canCompose?{[SUBMISSION_CAPABILITY]:submissionCapabilityProps()}:{};
-    const sessionState = canCompose ? "gmail-compose-v1" : writable ? "gmail-manage-v1" : "gmail-readonly-v1";
+    const submissionProps=google.schedule?{maxDelayedSend:google.schedule.maxDelayedSend,submissionExtensions:{FUTURERELEASE:["HOLDFOR","HOLDUNTIL"]}}:submissionCapabilityProps();
+    const extraCaps=canCompose?{[SUBMISSION_CAPABILITY]:submissionProps}:{};
+    const sessionState = canCompose ? (google.schedule ? "gmail-schedule-v1" : "gmail-compose-v1") : writable ? "gmail-manage-v1" : "gmail-readonly-v1";
     if (req.method === "GET" && path === "/jmap/session") {
       const mailProps = { maxMailboxesPerEmail: null, maxMailboxDepth: 1, maxSizeMailboxName: 1000,
         maxSizeAttachmentsPerEmail: canCompose ? 18_000_000 : 50_000_000, emailQuerySortOptions: ["receivedAt"], mayCreateTopLevelMailbox: writable };
