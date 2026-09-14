@@ -16,8 +16,30 @@ export interface GmailConfig {
   clientSecret: string;
   redirectUri: string;
   origin: string;
-  allowedEmails: ReadonlySet<string>;
+  /** Addresses (`user@example.com`) and whole domains (`@example.com`) allowed to connect. */
+  allowedEmails: AllowList;
   secureCookies: boolean;
+}
+
+/** Set-like allowlist: exact lower-case addresses plus `@domain` entries. */
+export class AllowList {
+  private readonly addresses = new Set<string>();
+  private readonly domains = new Set<string>();
+  constructor(entries: Iterable<string>) {
+    for (const raw of entries) {
+      const entry = raw.trim().toLowerCase();
+      if (!entry) continue;
+      if (entry.startsWith("@")) { if (entry.length > 1 && !entry.slice(1).includes("@")) this.domains.add(entry.slice(1)); }
+      else if (entry.includes("@")) this.addresses.add(entry);
+    }
+  }
+  get size(): number { return this.addresses.size + this.domains.size; }
+  has(email: string): boolean {
+    const e = email.trim().toLowerCase();
+    if (this.addresses.has(e)) return true;
+    const at = e.lastIndexOf("@");
+    return at > 0 && this.domains.has(e.slice(at + 1));
+  }
 }
 
 const positive = (value: string | undefined, fallback: number): number => {
@@ -47,9 +69,8 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
       (base.protocol !== "https:" && !(base.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(base.hostname)))) {
     throw new Error("Gmail PUBLIC_URL must be an HTTPS origin (HTTP loopback is allowed for development)");
   }
-  const allowedEmails = new Set((process.env.GMAIL_ALLOWED_EMAILS ?? "")
-    .split(",").map((email) => email.trim().toLowerCase()).filter(Boolean));
-  if (!allowedEmails.size) throw new Error("GMAIL_ALLOWED_EMAILS must name the accounts allowed to connect");
+  const allowedEmails = new AllowList((process.env.GMAIL_ALLOWED_EMAILS ?? "").split(","));
+  if (!allowedEmails.size) throw new Error("GMAIL_ALLOWED_EMAILS must name the accounts or @domains allowed to connect");
   return {
     writeEnabled: process.env.GMAIL_WRITE_ENABLED === "true",
     composeEnabled: process.env.GMAIL_COMPOSE_ENABLED === "true",

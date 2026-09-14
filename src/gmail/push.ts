@@ -19,7 +19,7 @@ export class GmailPush {
   private readonly timers: NodeJS.Timeout[] = [];
   readonly counters = { rejected: 0, ignored: 0, syncFailures: 0, changesPublished: 0 };
   constructor(private readonly store: GmailStore, private readonly account: (email: string) => GmailMail,
-    private readonly allowed: ReadonlySet<string>, private readonly config: { topic: string; token: string }, private readonly log: FastifyBaseLogger) {}
+    private readonly allowed: { has(email: string): boolean }, private readonly config: { topic: string; token: string }, private readonly log: FastifyBaseLogger) {}
 
   /** SSE stream for one Gmail account. Wire format identical to the legacy hub (RFC 8620 §7.3). */
   addStream(email: string, reply: FastifyReply, origin: string | null, opts: { types?: string[] | null; closeAfter?: boolean; pingSec?: number }): void {
