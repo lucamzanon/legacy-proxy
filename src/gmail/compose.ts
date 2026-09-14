@@ -3,7 +3,7 @@ import { simpleParser } from "mailparser";
 import { buildRfc822, type JmapEmailCreate, type BodyStructurePart } from "../mapping/buildMime.js";
 import { JmapError } from "../jmap/errors.js";
 import { SIDE_RESPONSES, type MethodTable } from "../jmap/router.js";
-import type { GmailApi } from "./api.js";
+import { GmailNotSent, type GmailApi } from "./api.js";
 import { GmailStore, type ScheduleRow } from "./store.js";
 import { upstreamId, type GmailMessage } from "./message.js";
 
@@ -354,8 +354,9 @@ export class GmailCompose {
   async destroy(id: string): Promise<void> {
     await this.check();
     const original = upstreamId(id, "m_");
-    if (this.c.store.submission(this.c.email, original))
-      fail("forbidden", "Submitted or uncertain drafts cannot be deleted through this operation");
+    // A draft whose send outcome is uncertain may still be discarded: deleting it can never cause a second send.
+    if (this.c.store.submission(this.c.email, original)?.result)
+      fail("forbidden", "Submitted drafts cannot be deleted through this operation");
     const m = await this.c.api.get<GmailMessage>(
       "messages/" + encodeURIComponent(this.c.store.upstreamId(this.c.email, original)),
       20,
@@ -475,12 +476,17 @@ export class GmailCompose {
     if (!this.c.store.beginSubmission(this.c.email, original, fingerprint))
       fail("serverFail", "Submission already in progress");
     // Persist the intent before crossing the network. An unknown outcome is never replayed.
-    const sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id }).catch(() =>
-      fail(
+    const sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id }).catch((e) => {
+      // Google never received or refused the send: nothing went out, so the draft stays sendable.
+      if (e instanceof GmailNotSent) {
+        this.c.store.abandonSubmission(this.c.email, original);
+        throw e;
+      }
+      return fail(
         "serverFail",
         "Send outcome is uncertain. Check Sent before sending again; the bridge will not automatically retry this draft.",
-      ),
-    );
+      );
+    });
     const result = {
       id: this.c.store.submission(this.c.email, original)!.id,
       emailId: "m_" + original,
@@ -596,7 +602,13 @@ export class GmailCompose {
     let sent: GmailMessage;
     try {
       sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id });
-    } catch {
+    } catch (e) {
+      if (e instanceof GmailNotSent) {
+        this.c.store.abandonSubmission(this.c.email, row.original);
+        // Transient (authorization, rate limit): retry next tick within the late tolerance. Refused: suspend.
+        if (e.type === "serverUnavailable") return this.c.store.scheduleRelease(row.id);
+        return suspend("Google refused the send (" + e.message + ")");
+      }
       return this.c.store.scheduleFinish(row.id, "uncertain", "Google did not confirm the send; check Sent");
     }
     const result = {

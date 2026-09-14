@@ -408,6 +408,27 @@ it("marks an unconfirmed Google send as uncertain and never replays it", async (
   const again = await submit(draft.id, null);
   expect(again.notCreated.s.description).toContain("uncertain");
 });
+it("retries a scheduled send Google never received and suspends one Google refused", async () => {
+  const { save, submit, getSub, mail, sends, state, store } = await setup();
+  const { GmailNotSent } = await import("../../src/gmail/api.js");
+  const draft = await save();
+  const s = (await submit(draft.id, { HOLDFOR: "1" })).created.s;
+  state.sendError = new GmailNotSent("serverUnavailable", "Google authorization expired or was revoked.");
+  await mail.runScheduled(Date.now() + 2_000);
+  expect((await getSub(s.id)).undoStatus).toBe("pending");
+  expect(store.submission(email, draft.id.slice(2))).toBeNull();
+  state.sendError = null;
+  await mail.runScheduled(Date.now() + 3_000);
+  expect((await getSub(s.id)).undoStatus).toBe("final");
+  expect(sends()).toBe(2);
+  const other = await save();
+  const o = (await submit(other.id, { HOLDFOR: "1" })).created.s;
+  state.sendError = new GmailNotSent("invalidProperties", "Google rejected the update");
+  await mail.runScheduled(Date.now() + 2_000);
+  expect((await getSub(o.id)).deliveryStatus["recipient@example.test"].delivered).toBe("no");
+  state.sendError = null;
+  expect((await submit(other.id, null)).created.s.undoStatus).toBe("final");
+});
 it("supports the client reschedule flow: replacement first, then cancel, and supersedes duplicates", async () => {
   const { save, submit, cancel, getSub, mail, sends } = await setup();
   const draft = await save();

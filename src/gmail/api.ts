@@ -4,6 +4,9 @@ import { GmailStore } from "./store.js";
 import { GMAIL_MODIFY } from "./config.js";
 import { JmapError } from "../jmap/errors.js";
 
+/** A write Google never received or explicitly refused: nothing changed upstream, so it is safe to retry. */
+export class GmailNotSent extends JmapError {}
+
 /** Shared per-account quota/concurrency budget, including concurrent JMAP envelopes. */
 export class GmailApi {
   private client?: GoogleClient;
@@ -38,7 +41,7 @@ export class GmailApi {
       this.connection.config?.composeEnabled &&
       ((method === "POST" && (resource === "drafts" || resource === "drafts/send")) ||
         (method === "DELETE" && /^drafts\/[A-Za-z0-9_-]+$/.test(resource)));
-    if (!allowed && !compose) throw new JmapError("forbidden", "Unsupported Gmail write operation");
+    if (!allowed && !compose) throw new GmailNotSent("forbidden", "Unsupported Gmail write operation");
     return this.request<T>(resource, cost, {}, method, data);
   }
   private async request<T>(
@@ -48,9 +51,12 @@ export class GmailApi {
     method?: "POST" | "PATCH" | "DELETE",
     body?: unknown,
   ): Promise<T> {
-    if (this.waiting.length >= 200) throw new JmapError("serverUnavailable", "Gmail request queue is full");
+    if (this.waiting.length >= 200)
+      throw new (method ? GmailNotSent : JmapError)("serverUnavailable", "Gmail request queue is full");
     if (this.active >= 4) await new Promise<void>((resolve) => this.waiting.push(resolve));
     else this.active++;
+    // Set right before a write reaches the network: failures before that point never changed Gmail.
+    let dispatched = false;
     try {
       const saved = await this.store.load(this.email);
       if (!saved) throw new JmapError("accountNotFound");
@@ -100,6 +106,7 @@ export class GmailApi {
           await new Promise((resolve) => setTimeout(resolve, wait));
         }
         try {
+          dispatched = true;
           const { data } = await client.request<T>({
             url: url.href,
             timeout: 15_000,
@@ -131,9 +138,18 @@ export class GmailApi {
           const temporary =
             networkFailure || rateLimited || (status !== undefined && [500, 502, 503, 504].includes(status));
           if (method) {
-            if (status === 404) throw new JmapError("notFound");
-            if (status === 400) throw new JmapError("invalidProperties", "Google rejected the update");
-            if (status === 409) throw new JmapError("alreadyExists");
+            // A 4xx answer means Google refused the write; timeouts, resets and 5xx leave the outcome unknown.
+            if (status === 404) throw new GmailNotSent("notFound");
+            if (status === 400) throw new GmailNotSent("invalidProperties", "Google rejected the update");
+            if (status === 409) throw new GmailNotSent("alreadyExists");
+            if (rateLimited) throw new GmailNotSent("serverUnavailable", "Google rate limit; retry later");
+            if (status === 401)
+              throw new GmailNotSent(
+                "serverUnavailable",
+                "Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.",
+              );
+            if (status !== undefined && status >= 400 && status < 500)
+              throw new GmailNotSent("forbidden", "Google refused the update; verify account permissions");
             throw new JmapError("serverFail", "Google update failed; refresh before retrying");
           }
           if (!temporary) {
@@ -162,21 +178,28 @@ export class GmailApi {
         }
       }
     } catch (error) {
-      if (error instanceof JmapError) throw error;
-      const status = (error as { response?: { status?: number } }).response?.status;
-      if (status === 404) throw new JmapError("notFound");
-      const reason = (error as { response?: { data?: { error?: unknown } } }).response?.data?.error;
-      if (status === 401 || reason === "invalid_grant")
-        throw new JmapError(
-          "serverUnavailable",
-          "Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.",
-        );
-      // Library errors may contain Authorization headers: never pass them to the dispatcher.
-      throw new JmapError("serverUnavailable", "Gmail request failed; reconnect if authorization expired");
+      const mapped = sanitize(error);
+      if (method && !dispatched && !(mapped instanceof GmailNotSent))
+        throw new GmailNotSent(mapped.type, mapped.message);
+      throw mapped;
     } finally {
       const next = this.waiting.shift();
       if (next) next();
       else this.active--;
     }
   }
+}
+
+/** Library errors may contain Authorization headers: never pass them to the dispatcher. */
+function sanitize(error: unknown): JmapError {
+  if (error instanceof JmapError) return error;
+  const status = (error as { response?: { status?: number } }).response?.status;
+  if (status === 404) return new JmapError("notFound");
+  const reason = (error as { response?: { data?: { error?: unknown } } }).response?.data?.error;
+  if (status === 401 || reason === "invalid_grant")
+    return new JmapError(
+      "serverUnavailable",
+      "Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.",
+    );
+  return new JmapError("serverUnavailable", "Gmail request failed; reconnect if authorization expired");
 }

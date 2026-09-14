@@ -264,6 +264,44 @@ it("persists uncertain send intent across a restart and never replays it", async
   expect(second.notCreated.s.description).toContain("uncertain");
   expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(1);
 });
+it("keeps a draft sendable when Google provably did not send it", async () => {
+  const { save, mail, mutate } = await setup();
+  const { GmailNotSent } = await import("../../src/gmail/api.js");
+  const draft = await save();
+  const implementation = mutate.getMockImplementation()!;
+  let refuse = true;
+  mutate.mockImplementation(async (...args: any[]) => {
+    if (args[0] === "drafts/send" && refuse)
+      throw new GmailNotSent("serverUnavailable", "Google authorization expired or was revoked.");
+    return (implementation as any)(...args);
+  });
+  const args = {
+    accountId: mail.accountId,
+    create: { s: { emailId: draft.id, identityId: "gi_" + mail.accountId } },
+  };
+  const first = (await mail.methods()["EmailSubmission/set"]!(args)) as any;
+  expect(first.notCreated.s.type).toBe("serverUnavailable");
+  refuse = false;
+  const second = (await mail.methods()["EmailSubmission/set"]!(args)) as any;
+  expect(second.created.s.undoStatus).toBe("final");
+  expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(2);
+});
+it("lets the client discard a draft whose send outcome is uncertain", async () => {
+  const { save, mail, mutate, drafts } = await setup();
+  const draft = await save();
+  const implementation = mutate.getMockImplementation()!;
+  mutate.mockImplementation(async (...args: any[]) => {
+    if (args[0] === "drafts/send") throw new JmapError("serverFail", "Unknown outcome");
+    return (implementation as any)(...args);
+  });
+  await mail.methods()["EmailSubmission/set"]!({
+    accountId: mail.accountId,
+    create: { s: { emailId: draft.id, identityId: "gi_" + mail.accountId } },
+  });
+  const r = (await mail.methods()["Email/set"]!({ accountId: mail.accountId, destroy: [draft.id] })) as any;
+  expect(r.destroyed).toEqual([draft.id]);
+  expect(drafts.size).toBe(0);
+});
 it("rejects foreign identity, different SMTP envelope and delayed-send parameters before sending", async () => {
   const { save, mail, mutate } = await setup();
   const draft = await save();

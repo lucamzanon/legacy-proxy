@@ -315,6 +315,12 @@ export class GmailStore {
       null
     );
   }
+  /** Drops an intent whose send provably never happened, so the draft can be sent again. */
+  abandonSubmission(email: string, original: string): void {
+    this.db
+      .prepare("DELETE FROM gmail_submission WHERE email=? AND original=? AND result IS NULL")
+      .run(email, original);
+  }
   finishSubmission(email: string, original: string, result: unknown, current: string): void {
     this.db.transaction(() => {
       this.db

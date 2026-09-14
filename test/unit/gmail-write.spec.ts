@@ -238,6 +238,44 @@ it("guards mutation in the API gateway and never retries ambiguous writes", asyn
   expect(request).toHaveBeenCalledTimes(1);
   expect((await store.load(email))!.credentials.scopes).toEqual([GMAIL_MODIFY]);
 });
+it("marks writes Google never received or refused as safe to retry", async () => {
+  const { store } = await setup();
+  const { GmailNotSent } = await import("../../src/gmail/api.js");
+  const make = (client: any) =>
+    new GmailApi(
+      email,
+      { config: { writeEnabled: true, composeEnabled: true }, createClient: () => client } as any,
+      store,
+    );
+  const base = {
+    credentials: {},
+    setCredentials(c: any) {
+      this.credentials = c;
+    },
+  };
+  const expired = make({
+    ...base,
+    getAccessToken: async () => {
+      throw { response: { data: { error: "invalid_grant" } } };
+    },
+    request: vi.fn(),
+  });
+  await expect(expired.mutate("drafts/send", 100, "POST", { id: "d" })).rejects.toBeInstanceOf(GmailNotSent);
+  const rejected = make({
+    ...base,
+    getAccessToken: async () => {},
+    request: vi.fn().mockRejectedValue({ response: { status: 400 } }),
+  });
+  await expect(rejected.mutate("drafts/send", 100, "POST", { id: "d" })).rejects.toBeInstanceOf(GmailNotSent);
+  const unknown = make({
+    ...base,
+    getAccessToken: async () => {},
+    request: vi.fn().mockRejectedValue({ code: "ECONNRESET" }),
+  });
+  const error = await unknown.mutate("drafts/send", 100, "POST", { id: "d" }).catch((e) => e);
+  expect(error).not.toBeInstanceOf(GmailNotSent);
+  expect(error.type).toBe("serverFail");
+});
 
 it("updates session permissions after consent without changing the bridge password", async () => {
   const { store, mail } = await setup([GMAIL_READONLY]);
