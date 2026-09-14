@@ -106,6 +106,9 @@ export class GmailStore {
       .run(email, crypto.createHash("sha256").update(password).digest("hex"));
     return password;
   }
+  hasPassword(email: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM gmail_password WHERE email=?").get(email);
+  }
   authenticate(password: string, username?: string): string | null {
     if (!/^gmap_[A-Za-z0-9_-]{43}$/.test(password)) return null;
     const hash = crypto.createHash("sha256").update(password).digest("hex");

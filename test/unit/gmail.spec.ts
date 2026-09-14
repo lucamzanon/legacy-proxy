@@ -417,4 +417,75 @@ describe("self-service bridge password", () => {
       await app.close();
     }
   });
+  it("issues a first password automatically and never claims a rotated password still works", async () => {
+    const app = Fastify();
+    let has = false;
+    const store = {
+      issuePassword: vi.fn(() => {
+        has = true;
+        return "gmap_first";
+      }),
+      hasPassword: vi.fn(() => has),
+    };
+    const connection = {
+      authorization: vi.fn(async (state: string) => ({
+        url: `https://accounts.google.com/o/oauth2/v2/auth?state=${state}`,
+        verifier: "v",
+      })),
+      connect: vi.fn(async () => "tester@gmail.com"),
+    };
+    await registerGmailRoutes(app, { config, connection, store });
+    const run = async (payload: string) => {
+      const start = await app.inject({
+        method: "POST",
+        url: "/auth/google/start",
+        headers: { origin: config.origin, "content-type": "application/x-www-form-urlencoded" },
+        payload,
+      });
+      const state = new URL(String(start.headers.location)).searchParams.get("state");
+      const cookie = String(start.headers["set-cookie"]).split(";")[0]!;
+      return app.inject({ url: `/auth/google/callback?state=${state}&code=abc`, headers: { cookie } });
+    };
+    try {
+      expect((await app.inject("/auth/google/start")).body).not.toContain("checked");
+      expect((await run("")).headers.location).toBe("/auth/google/result?status=issued");
+      expect(store.issuePassword).toHaveBeenCalledTimes(1);
+      expect((await run("")).headers.location).toBe("/auth/google/result?status=connected");
+      expect(store.issuePassword).toHaveBeenCalledTimes(1);
+      const reload = await app.inject("/auth/google/result?status=issued");
+      expect(reload.body).not.toContain("still works");
+      expect(reload.body).toContain("no longer works");
+    } finally {
+      await app.close();
+    }
+  });
+  it("keeps no server-side state for flows that are started but never finished", async () => {
+    const app = Fastify();
+    const connection = {
+      authorization: vi.fn(async (state: string) => ({
+        url: `https://accounts.google.com/o/oauth2/v2/auth?state=${state}`,
+        verifier: "v",
+      })),
+      connect: vi.fn(async () => {}),
+    };
+    await registerGmailRoutes(app, { config, connection });
+    try {
+      for (let i = 0; i < 150; i++) {
+        const started = await app.inject({
+          method: "POST",
+          url: "/auth/google/start",
+          headers: { origin: config.origin },
+        });
+        expect(started.statusCode).toBe(303);
+      }
+      const forged = await app.inject({
+        url: "/auth/google/callback?state=x&code=c",
+        headers: { cookie: "gmail_oauth=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      });
+      expect(forged.statusCode).toBe(400);
+      expect(connection.connect).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
 });
