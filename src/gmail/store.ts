@@ -24,7 +24,7 @@ export interface GmailSnapshot {
   labels: GmailLabel[];
 }
 
-/** Separate from legacy IMAP account rows until Gmail JMAP methods are available. */
+/** Gmail backend state (grants, bridge passwords, cache, drafts, queues), kept apart from the legacy IMAP account rows. */
 export class GmailStore {
   private readonly db: Database.Database;
   constructor(

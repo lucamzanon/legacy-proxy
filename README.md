@@ -302,6 +302,10 @@ connect and for how long. In the [Google Cloud console](https://console.cloud.go
 4. Create an OAuth client of type **Web application** and register this exact
    redirect URI, replacing the origin with the proxy's `PUBLIC_URL`:
 
+   ```text
+   https://bridge.example.com/auth/google/callback
+   ```
+
 Store the downloaded client JSON outside the repository, readable only by the
 service account. Configure the proxy:
 
@@ -319,21 +323,30 @@ after ten minutes. Callback logs are suppressed and no tokens are returned to
 the browser. Restarting the service invalidates pending authorization flows;
 start again if this happens during consent.
 
-Self-service onboarding: the consent page at `/auth/google/start` has an "Issue a
-bridge password for Bulwark" checkbox (on by default). After a successful consent
-the result page shows server, username and a freshly issued bridge password exactly
-once, bound to that browser and expiring after two minutes; any previous bridge
-password for that account stops working. Untick the box to reconnect (for example
-after a revoked grant) while keeping the existing password. `npm run gmail:password`
-remains available for operators.
+Self-service onboarding: the first successful consent for an account issues a bridge
+password, and the result page shows server, username and password exactly once,
+bound to that browser and expiring after two minutes. Reconnecting later (for example
+after a revoked grant or Testing's seven-day expiry) keeps the existing password
+unless "Issue a new bridge password" is ticked, which replaces it. A pending consent
+lives in an encrypted, browser-bound cookie rather than in server memory, so abandoned
+or scripted starts cannot block other users. `npm run gmail:password` remains
+available for operators.
 
 Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
 The same database caches metadata, message bodies and attachment bytes in plaintext;
 protect `DATA_DIR` and its backups. Cached values expire and are bounded to 256 MiB
-of logical data per account (SQLite may retain free pages). Its `historyId` is a
-profile observation, **not** a completed mail-sync cursor.
+of logical data per account (SQLite may retain free pages).
 Google Testing refresh tokens with Gmail scopes expire after seven days; reconnect
 when consent expires or is revoked.
+
+To remove an account, revoke its Google grant and delete everything the bridge stored
+for it (tokens, bridge password, cache, draft mappings, send ledger and queues):
+
+```bash
+npm run gmail:disconnect -- tester@gmail.com
+```
+
+Also remove the address from `GMAIL_ALLOWED_EMAILS` if it should not connect again.
 
 After building, verify the saved connection (including token refresh when needed):
 
@@ -341,13 +354,13 @@ After building, verify the saved connection (including token refresh when needed
 npm run gmail:check -- tester@gmail.com
 ```
 
-This refreshes the profile/label snapshot and prints only counts. No background
-mail sync is enabled yet. JMAP reads retry temporary Google rate/server errors
-at most twice with exponential backoff and a shared account cooldown. Long
-Retry-After delays return an error immediately; permanent permission errors are
-not retried. The diagnostic snapshot command itself does not retry. Token refresh is coalesced within
-one process; run a single writer per data directory during this experimental
-stage. Google requests have timeouts, and failed checks retain the last snapshot.
+This refreshes the profile/label snapshot and prints only counts. JMAP reads retry
+temporary Google rate/server errors at most twice with exponential backoff and a
+shared account cooldown. Long Retry-After delays return an error immediately;
+permanent permission errors are not retried. The diagnostic snapshot command itself
+does not retry. Token refresh is coalesced within one process; run a single writer
+per data directory during this experimental stage. Google requests have timeouts,
+and failed checks retain the last snapshot.
 
 Create a dedicated JMAP password after consent, using a new private output path:
 
@@ -359,14 +372,17 @@ The file contains `serverUrl`, `username` and `password` for the client's custom
 JMAP account. Only a SHA-256 hash of this randomly generated password is stored.
 Reissuing it immediately revokes the previous bridge password. Basic auth with
 that username/password or Bearer auth with the bridge password is supported;
-Google tokens stay on the server. Removing the email from the allowlist and
-restarting also blocks access, including to cached data.
+Google tokens stay on the server. Only passwords starting with `gmap_` select the
+Gmail API backend; any other password for the same address, such as an IMAP App
+Password, is handled by the regular IMAP backend. Removing the email from the
+allowlist and restarting also blocks access, including to cached data.
 
 Expose `/jmap`, `/jmap/*` and `/.well-known/jmap` alongside the OAuth routes at
 the HTTPS reverse proxy. Account and mailbox rights stay read-only unless both
-the operator enables writes and the account grants modify consent. Uploads and submission remain unavailable until composition is enabled;
-push is not advertised. Clients poll
-for changes; a changed state requires a full client refresh (`cannotCalculateChanges`).
+the operator enables writes and the account grants modify consent. Uploads and
+submission remain unavailable until composition is enabled. Changes are synced
+incrementally (see below); with push configured, clients also get EventSource
+notifications instead of polling.
 
 To enable mail management, add `https://www.googleapis.com/auth/gmail.modify`
 to the Google consent configuration and set `GMAIL_WRITE_ENABLED=true`. Restart,
@@ -394,8 +410,8 @@ patch is validated before sending one Gmail modify request per message. Set
 responses report partial failures by ID. Ambiguous writes are not automatically
 retried (including label creation); refresh before manually retrying. Successful
 and uncertain writes invalidate caches and advance a persistent local revision;
-reads started before invalidation cannot repopulate those cache entries. External
-Gmail updates still use the polling/full-refresh behavior described below.
+reads started before invalidation cannot repopulate those cache entries. Changes
+made in Gmail itself are picked up by the incremental sync described below.
 
 Set `GMAIL_COMPOSE_ENABLED=true` together with `GMAIL_WRITE_ENABLED=true` to enable
 composition. The existing verified `gmail.modify` grant is sufficient; reload the
@@ -431,9 +447,13 @@ in protected SQLite, separately from the disposable read cache. Do not publish i
 
 Submission uses `drafts.send` and Gmail's native Sent filing. A durable intent is
 recorded before calling Google; requests to send that same draft are not replayed
-after an uncertain outcome, even across restarts. Check Sent before composing a new
-copy if the outcome is unknown. This is per-draft deduplication, not deduplication of
-separately created messages. Successfully sent drafts keep a stable JMAP email ID
+after an uncertain outcome, even across restarts. Only timeouts, dropped connections
+and 5xx answers count as uncertain: a send Google provably never received (expired or
+revoked authorization, rate limiting, a full request queue) or refused with a 4xx
+answer releases the intent, so the draft can be sent again once the cause is fixed.
+Check Sent before composing a new copy if the outcome is unknown; a draft whose send
+is uncertain can still be discarded. This is per-draft deduplication, not
+deduplication of separately created messages. Successfully sent drafts keep a stable JMAP email ID
 through a persisted mapping to Gmail's new message ID. Existing drafts edited
 outside the bridge are checked before sending/discarding to avoid acting on a
 replacement the client has not seen.
@@ -453,7 +473,9 @@ identity, or an entry that comes due while the bridge is down for longer than
 `GMAIL_SCHEDULE_LATE_TOLERANCE` (default 900 s) is **suspended**, never sent: the
 submission becomes final with a per-recipient `deliveryStatus` explaining why and the
 draft remains in Drafts to be sent again by hand. Transient Google errors before the
-send call leave the entry pending for the next tick.
+send call leave the entry pending for the next tick, and so does a send Google
+refused for authorization or rate-limit reasons; a send Google rejects outright is
+suspended.
 
 `EmailSubmission/set` `update: {id: {undoStatus: "canceled"}}` cancels a pending
 entry atomically (`cannotUnsend` once it is being handed to Google or already
@@ -463,7 +485,8 @@ draft are allowed: the first to send wins and the others end up `canceled`
 (superseded). An unconfirmed `drafts.send` marks the entry uncertain (final,
 `delivered: unknown`) and blocks any further send of that draft, exactly like
 immediate sends. Entries found in `sending` after a restart are reconciled through
-the ledger (sent or uncertain). `onSuccessUpdateEmail` filing patches on a held
+the ledger: sent, uncertain when `drafts.send` was already in flight, and otherwise
+back to pending (the late tolerance still applies). `onSuccessUpdateEmail` filing patches on a held
 submission answer `forbidden` in the implicit `Email/set`: Gmail files the message
 when it is actually sent. `/healthz` exposes per-status queue counters and nothing
 else.
@@ -472,8 +495,8 @@ Without the flag, only immediate sends are supported (`maxDelayedSend=0`): no de
 custom SMTP envelope recipients/sender, SMTP parameters, delivery reports or
 post-send deletion. Explicit envelopes must match the MIME recipients and account
 sender. Submission/get exposes the most recent 100 successful bridge submissions;
-no incremental submission changes are implemented. Submitted/uncertain draft IDs
-cannot subsequently be discarded through the draft-delete path.
+no incremental submission changes are implemented. Sent draft IDs cannot be
+discarded through the draft-delete path; a draft whose send outcome is uncertain can.
 
 ### Incremental sync and recovery
 
@@ -502,18 +525,27 @@ Gmail's native thread ID only when the parent header and normalized subject matc
 
 ### Push notifications (Cloud Pub/Sub)
 
-Set `GMAIL_PUSH_TOPIC=projects/<project>/topics/<topic>` and a random
-`GMAIL_PUSH_TOKEN` (24+ characters) to replace polling with Gmail push. One-time
-Google Cloud setup, in the project that owns the OAuth client: enable the Pub/Sub
-API, create the topic, grant `roles/pubsub.publisher` on it to
-`gmail-api-push@system.gserviceaccount.com`, and create a **push** subscription whose
-endpoint is `https://<PUBLIC_URL>/gmail/push?token=<GMAIL_PUSH_TOKEN>` (expose that
-path through your reverse proxy). The bridge then calls `users.watch` for every
-connected account at startup and re-issues it every 24 h (Google expires watches
-after 7 days); failures are counted and retried hourly.
+Set `GMAIL_PUSH_TOPIC=projects/<project>/topics/<topic>` to replace polling with Gmail
+push; it also works with read-only consent. One-time Google Cloud setup, in the
+project that owns the OAuth client: enable the Pub/Sub API, create the topic, grant
+`roles/pubsub.publisher` on it to `gmail-api-push@system.gserviceaccount.com`, and
+create a **push** subscription for `https://<PUBLIC_URL>/gmail/push` (expose that path
+through your reverse proxy). Authenticate the subscription in one of two ways:
 
-Each notification is authenticated by the token (constant-time compare), persisted
-before it is acknowledged, and coalesced per account (1.5 s) into one run of the
+- **Authenticated push (recommended):** enable authentication on the subscription with
+  a service account, set `GMAIL_PUSH_AUDIENCE` to the subscription's audience (the
+  endpoint URL unless you chose another) and `GMAIL_PUSH_SERVICE_ACCOUNT` to that
+  service account's email. Every request must then carry a Google-signed OIDC token for
+  that account, and no secret appears in URLs or access logs.
+- **Shared token:** set a random `GMAIL_PUSH_TOKEN` (24+ characters) and use
+  `https://<PUBLIC_URL>/gmail/push?token=<GMAIL_PUSH_TOKEN>` as the endpoint. The bridge
+  never logs the query string, but a reverse proxy may, so keep its access logs private.
+
+The bridge calls `users.watch` for every connected account at startup and re-issues it
+every 24 h (Google expires watches after 7 days); failures are counted and retried
+hourly.
+
+Each notification is authenticated, persisted before it is acknowledged, and coalesced per account (1.5 s) into one run of the
 existing incremental engine. Duplicates and out-of-order deliveries are harmless:
 the engine always starts from the persisted history cursor. With push configured
 the session advertises `eventSourceUrl`; `GET /jmap/eventsource` streams RFC 8620
@@ -523,23 +555,29 @@ also re-synced every 5 minutes as a safety net for notifications Google delays o
 drops. `/healthz` reports watches, renewal failures, notification counts and open
 streams; addresses and message contents are never logged.
 
-Ordinary newest-first folder pages use exact label/profile counts and fetch only
-the required ID pages. Searches, oldest-first ordering, anchors and collapsed
-thread queries enumerate matching IDs before slicing, which can be slow on large
-accounts. Gmail's estimated search total is never returned as an exact total.
+Ordinary newest-first folder pages list by label id, use exact label/profile counts
+and fetch only the required ID pages. Searches, oldest-first ordering, anchors and
+collapsed thread queries enumerate matching IDs before slicing, which can be slow on
+large accounts. Gmail's estimated search total is never returned as an exact total.
 Profiles refresh after 30 seconds, label details after at most 60 seconds; cached
 queries are keyed by observed history state. Gmail does not provide a transactional
 snapshot across pages, so concurrent mailbox changes can still affect pagination.
 
 Email IDs are stable across labels. The synthetic `All mail` mailbox includes
 **spam and trash**, matching the account-wide profile counts. Label names are
-flat. Only `receivedAt` sorting is accepted, using Gmail's native list order
-(or its reverse); strict timestamp ordering is not guaranteed by the list API.
-Supported search conditions are mailbox, the four standard mapped keywords,
-address fields, subject/text, dates, sizes and attachment presence, combined with
-AND/OR/NOT. Searches inherit Gmail token matching and date granularity; other
-conditions, including `inMailboxOtherThan`, are rejected. Header/body projections
-and on-demand MIME part downloads are supported; downloads are capped at 50 MB.
+flat. Gmail's unread, starred, important and Chat labels are not listed as mailboxes
+(the `$seen`, `$flagged` and `$important` keywords carry them); system labels get
+readable names, and labels hidden in Gmail's label list are unsubscribed. Only
+`receivedAt` sorting is accepted, using Gmail's native list order (or its reverse);
+strict timestamp ordering is not guaranteed by the list API. Supported search
+conditions are `inMailbox`, `inMailboxOtherThan` (treated as "in none of these",
+because every message is also in All mail), the four standard mapped keywords,
+address fields, subject, free text (every word must match; quoted phrases stay
+phrases), dates, sizes and attachment presence, combined with AND/OR/NOT. Searches
+inherit Gmail token matching and date granularity; other conditions are rejected.
+Header/body projections and on-demand MIME part downloads are supported; downloads
+are capped at 50 MB. Email/get calls that ask only for header-derived properties use
+Gmail's lighter metadata format, and Thread/get fetches up to four threads at once.
 The gateway limits each account to four concurrent Google requests and budgets
 4,800 quota units/minute using the [current method costs](https://developers.google.com/workspace/gmail/api/reference/quota).
 
