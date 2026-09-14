@@ -20,7 +20,10 @@ export class GmailApi {
   async mutate<T>(resource: string, cost: number, method: "POST" | "PATCH" | "DELETE", data?: unknown): Promise<T> {
     const allowed = method === "POST" && (resource === "labels" || /^messages\/[A-Za-z0-9_-]+\/modify$/.test(resource)) ||
       (method === "PATCH" || method === "DELETE") && /^labels\/[A-Za-z0-9_-]+$/.test(resource);
-    if(!allowed)throw new JmapError("forbidden", "Unsupported Gmail write operation");
+    const compose = this.connection.config?.composeEnabled && (
+      method === "POST" && (resource === "drafts" || resource === "drafts/send") ||
+      method === "DELETE" && /^drafts\/[A-Za-z0-9_-]+$/.test(resource));
+    if(!allowed && !compose)throw new JmapError("forbidden", "Unsupported Gmail write operation");
     return this.request<T>(resource,cost,{},method,data);
   }
   private async request<T>(resource: string, cost: number, params: Record<string,string>, method?: "POST" | "PATCH" | "DELETE", body?: unknown): Promise<T> {

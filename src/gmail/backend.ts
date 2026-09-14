@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyBaseLogger, RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression } from "fastify";
 import type { AppConfig } from "../util/config.js";
-import { CORE_CAPABILITY, MAIL_CAPABILITY, coreCapabilityProps } from "../jmap/capabilities.js";
+import { CORE_CAPABILITY, MAIL_CAPABILITY, SUBMISSION_CAPABILITY, submissionCapabilityProps, coreCapabilityProps } from "../jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "../jmap/router.js";
 import { JmapError } from "../jmap/errors.js";
 import type { GmailConfig } from "./config.js";
@@ -12,9 +12,9 @@ import { GmailMail } from "./mail.js";
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyInstance<RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression, L>, cfg: AppConfig, google: GmailConfig,
   store: GmailStore, connection: GmailConnection,
-  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false)): void {
+  makeMail = (email: string) => new GmailMail(email, new GmailApi(email, connection, store), store, google.writeEnabled ?? false, google.composeEnabled ?? false)): void {
   const accounts = new Map<string, GmailMail>();
-  const authenticated = new WeakMap<object, { email: string; mail: GmailMail }>();
+  const authenticated = new WeakMap<object, { email: string; mail: GmailMail; uploadType?: string }>();
   app.addHook("onRequest", async (req, reply) => {
     const path = req.url.split("?")[0]!;
     if (path !== "/jmap" && !path.startsWith("/jmap/")) return;
@@ -34,7 +34,13 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     if (!mail) { mail = makeMail(email); accounts.set(email, mail); }
     authenticated.set(req, { email, mail });
     reply.header("Cache-Control", "no-store");
-    if (path.startsWith("/jmap/upload/")) return reply.code(403).send({ type: "accountReadOnly" });
+    if (path.startsWith("/jmap/upload/")) {
+      if(!await mail.canCompose())return reply.code(403).send({type:"accountReadOnly"});
+      const type=req.headers["content-type"]?.split(";")[0]??"application/octet-stream";
+      authenticated.set(req,{email,mail,uploadType:type});
+      // Preserve exact bytes even for text/json uploads: use the existing binary parser.
+      req.headers["content-type"]="application/octet-stream";
+    }
   });
   app.addHook("preHandler", async (req, reply) => {
     const selected = authenticated.get(req);
@@ -42,13 +48,15 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
     const { email, mail } = selected;
     const path = req.url.split("?")[0]!;
     const writable=await mail.writable();
-    const sessionState = writable ? "gmail-manage-v1" : "gmail-readonly-v1";
+    const canCompose=await mail.canCompose();
+    const extraCaps=canCompose?{[SUBMISSION_CAPABILITY]:submissionCapabilityProps()}:{};
+    const sessionState = canCompose ? "gmail-compose-v1" : writable ? "gmail-manage-v1" : "gmail-readonly-v1";
     if (req.method === "GET" && path === "/jmap/session") {
       const mailProps = { maxMailboxesPerEmail: null, maxMailboxDepth: 1, maxSizeMailboxName: 1000,
-        maxSizeAttachmentsPerEmail: 50_000_000, emailQuerySortOptions: ["receivedAt"], mayCreateTopLevelMailbox: writable };
-      return reply.send({ capabilities: { [CORE_CAPABILITY]: { ...coreCapabilityProps(cfg), maxObjectsInGet: 100, maxObjectsInSet: 20 }, [MAIL_CAPABILITY]: {} },
-        accounts: { [mail.accountId]: { name: email, isPersonal: true, isReadOnly: !writable, accountCapabilities: { [MAIL_CAPABILITY]: mailProps } } },
-        primaryAccounts: { [MAIL_CAPABILITY]: mail.accountId }, username: email,
+        maxSizeAttachmentsPerEmail: canCompose ? 18_000_000 : 50_000_000, emailQuerySortOptions: ["receivedAt"], mayCreateTopLevelMailbox: writable };
+      return reply.send({ capabilities: { [CORE_CAPABILITY]: { ...coreCapabilityProps(cfg), maxObjectsInGet: 100, maxObjectsInSet: 20, maxSizeUpload:25_000_000 }, [MAIL_CAPABILITY]: {}, ...extraCaps },
+        accounts: { [mail.accountId]: { name: email, isPersonal: true, isReadOnly: !writable, accountCapabilities: { [MAIL_CAPABILITY]: mailProps, ...extraCaps } } },
+        primaryAccounts: { [MAIL_CAPABILITY]: mail.accountId, ...(canCompose?{[SUBMISSION_CAPABILITY]:mail.accountId}:{}) }, username: email,
         apiUrl: `${cfg.publicUrl}/jmap`, downloadUrl: `${cfg.publicUrl}/jmap/download/{accountId}/{blobId}/{type}/{name}`,
         uploadUrl: `${cfg.publicUrl}/jmap/upload/{accountId}`, state: sessionState });
     }
@@ -59,11 +67,17 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(app: FastifyIn
             !c[1] || typeof c[1] !== "object" || Array.isArray(c[1]) || typeof c[2] !== "string")) {
         return reply.code(400).send({ error: "malformed JMAP request" });
       }
-      if (env.using.some((c) => c !== CORE_CAPABILITY && c !== MAIL_CAPABILITY))
+      if (env.using.some((c) => c !== CORE_CAPABILITY && c !== MAIL_CAPABILITY && !(canCompose && c===SUBMISSION_CAPABILITY)))
         return reply.code(400).send({ type: "urn:ietf:params:jmap:error:unknownCapability", status: 400 });
       if (env.methodCalls.length > cfg.limits.maxCallsInRequest)
         return reply.code(400).send({ type: "urn:ietf:params:jmap:error:limit", limit: "maxCallsInRequest", status: 400 });
       return reply.send(await dispatch(env, { methods: mail.methods(), maxCallsInRequest: cfg.limits.maxCallsInRequest, sessionState }));
+    }
+    if(req.method==="POST" && path.startsWith("/jmap/upload/")){
+      if((req.params as {accountId:string}).accountId!==mail.accountId)return reply.code(404).send({error:"not found"});
+      if(!Buffer.isBuffer(req.body))return reply.code(400).send({error:"Invalid upload"});
+      try{const type=selected.uploadType??"application/octet-stream";const blobId=await mail.upload(req.body,type);return reply.send({accountId:mail.accountId,blobId,type,size:req.body.length});}
+      catch{return reply.code(413).send({type:"tooLarge"});}
     }
     if (req.method === "GET" && path.startsWith("/jmap/download/")) {
       const p = req.params as { accountId: string; blobId: string; type: string; name: string };

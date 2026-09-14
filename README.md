@@ -337,8 +337,8 @@ restarting also blocks access, including to cached data.
 
 Expose `/jmap`, `/jmap/*` and `/.well-known/jmap` alongside the OAuth routes at
 the HTTPS reverse proxy. Account and mailbox rights stay read-only unless both
-the operator enables writes and the account grants modify consent. Uploads and
-submission/push capabilities remain unavailable. Clients poll
+the operator enables writes and the account grants modify consent. Uploads and submission remain unavailable until composition is enabled;
+push is not advertised. Clients poll
 for changes; a changed state requires a full client refresh (`cannotCalculateChanges`).
 
 To enable mail management, add `https://www.googleapis.com/auth/gmail.modify`
@@ -351,8 +351,8 @@ again without changing the password. Old or incomplete grants remain read-only.
 Supported updates: `$seen`, `$flagged`, `$important`, mailbox membership for Inbox,
 Spam, Trash and user labels; create/rename/delete flat user labels. Full keyword
 maps and per-key JSON Pointer patches work. Unsupported custom keywords, draft
-changes, nested label parents, uploads, mail creation, sending and permanent mail
-deletion are rejected. Label deletion never deletes messages: nonempty labels
+changes, nested label parents and permanent mail deletion are rejected.
+Draft creation/uploads/sending require the additional compose flag below. Label deletion never deletes messages: nonempty labels
 require `onDestroyRemoveEmails=true` to remove their membership from messages.
 
 In management mode, All mail has the `archive` role for client interoperability.
@@ -369,6 +369,40 @@ retried (including label creation); refresh before manually retrying. Successful
 and uncertain writes invalidate caches and advance a persistent local revision;
 reads started before invalidation cannot repopulate those cache entries. External
 Gmail updates still use the polling/full-refresh behavior described below.
+
+Set `GMAIL_COMPOSE_ENABLED=true` together with `GMAIL_WRITE_ENABLED=true` to enable
+composition. The existing verified `gmail.modify` grant is sufficient; reload the
+client to discover the submission capability. The initial identity is the connected
+account address only; aliases and identity editing are not supported yet.
+
+The compose path supports plain text, HTML, Cc/Bcc, reply headers, MIME body
+structures, inline parts and uploaded or existing message attachments. New mail
+must target Drafts. Draft saves use native Gmail drafts; Bulwark replaces an edited
+draft by creating the replacement before discarding the old copy. Email/set destroy
+can discard a draft, but cannot permanently delete received/sent mail. Email/import
+accepts MIME into Drafts only; importing archives is not implemented.
+
+Uploads preserve exact bytes (including JSON attachments), are scoped to the
+account, expire after 24 hours and are capped at 25 MB each / 100 MB total per
+account. Complete encoded MIME is capped at 25 MB; the session advertises an 18 MB
+attachment allowance to leave room for MIME encoding. Upload/draft metadata lives
+in protected SQLite, separately from the disposable read cache. Do not publish it.
+
+Submission uses `drafts.send` and Gmail's native Sent filing. A durable intent is
+recorded before calling Google; requests to send that same draft are not replayed
+after an uncertain outcome, even across restarts. Check Sent before composing a new
+copy if the outcome is unknown. This is per-draft deduplication, not deduplication of
+separately created messages. Successfully sent drafts keep a stable JMAP email ID
+through a persisted mapping to Gmail's new message ID. Existing drafts edited
+outside the bridge are checked before sending/discarding to avoid acting on a
+replacement the client has not seen.
+
+Only immediate sends are supported (`maxDelayedSend=0`): no delayed send, undo,
+custom SMTP envelope recipients/sender, SMTP parameters, delivery reports or
+post-send deletion. Explicit envelopes must match the MIME recipients and account
+sender. Submission/get exposes the most recent 100 successful bridge submissions;
+no incremental submission changes are implemented. Submitted/uncertain draft IDs
+cannot subsequently be discarded through the draft-delete path.
 
 Ordinary newest-first folder pages use exact label/profile counts and fetch only
 the required ID pages. Searches, oldest-first ordering, anchors and collapsed

@@ -6,6 +6,7 @@ export const GMAIL_MODIFY = "https://www.googleapis.com/auth/gmail.modify";
 
 export interface GmailConfig {
   writeEnabled?: boolean;
+  composeEnabled?: boolean;
   clientId: string;
   clientSecret: string;
   redirectUri: string;
@@ -33,6 +34,7 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
   if (!allowedEmails.size) throw new Error("GMAIL_ALLOWED_EMAILS must name the accounts allowed to connect");
   return {
     writeEnabled: process.env.GMAIL_WRITE_ENABLED === "true",
+    composeEnabled: process.env.GMAIL_COMPOSE_ENABLED === "true",
     clientId: web.client_id, clientSecret: web.client_secret,
     origin: base.origin, redirectUri: `${base.origin}/auth/google/callback`,
     allowedEmails, secureCookies: base.protocol === "https:",

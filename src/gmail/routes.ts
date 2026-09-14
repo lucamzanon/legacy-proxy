@@ -39,7 +39,7 @@ export async function registerGmailRoutes(app: FastifyInstance, options: {
     // no-referrer makes browsers send Origin: null on native form POSTs.
     // Keep the origin on this form page; callbacks retain no-referrer above.
     scope.get("/auth/google/start", { logLevel: "silent" }, async (_req, reply) => reply.header("Referrer-Policy", "same-origin").type("text/html").send(page(
-      `<p>${config.writeEnabled ? 'Authorize reading and organizing mail: read/unread, stars, archive, trash and labels. Sending and permanent deletion are not available in this bridge.' : 'Connect your Gmail account with read-only access.'} Only accounts enabled by the operator can connect.</p><form method="post" action="/auth/google/start"><button type="submit">Connect Gmail</button></form>`,
+      `<p>${config.writeEnabled ? 'Authorize reading and organizing mail: read/unread, stars, archive, trash and labels. Sending is available only when composition is enabled by the operator; permanent mail deletion is not available.' : 'Connect your Gmail account with read-only access.'} Only accounts enabled by the operator can connect.</p><form method="post" action="/auth/google/start"><button type="submit">Connect Gmail</button></form>`,
     )));
     scope.post("/auth/google/start", { logLevel: "silent" }, async (req, reply) => {
       if (req.headers.origin !== config.origin) return reply.code(403).send({ error: "Invalid origin" });
