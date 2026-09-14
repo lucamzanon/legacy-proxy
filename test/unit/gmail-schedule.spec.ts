@@ -447,30 +447,30 @@ it("supports the client reschedule flow: replacement first, then cancel, and sup
   expect((await getSub(y.id)).undoStatus).toBe("canceled");
 });
 it("reconciles entries interrupted mid-send on restart", async () => {
-  const { save, submit, store, mail, getSub, make } = await setup();
+  const { save, submit, store, make } = await setup();
   const a = await save();
   const b = await save();
+  const c = await save();
   const sa = (await submit(a.id, { HOLDFOR: "1" })).created.s;
   const sb = (await submit(b.id, { HOLDFOR: "1" })).created.s;
-  expect(store.scheduleLease(sa.id)).toBe(true);
-  expect(store.scheduleLease(sb.id)).toBe(true);
+  const sc = (await submit(c.id, { HOLDFOR: "1" })).created.s;
+  for (const s of [sa, sb, sc]) expect(store.scheduleLease(s.id)).toBe(true);
+  // a stopped before drafts.send, b was sent, c stopped while drafts.send was in flight.
   store.beginSubmission(email, b.id.slice(2), sb.id);
   store.finishSubmission(email, b.id.slice(2), { id: sb.id, undoStatus: "final" }, "sentX");
-  expect(store.scheduleRecover()).toBe(2);
+  store.beginSubmission(email, c.id.slice(2), sc.id);
+  expect(store.scheduleRecover()).toBe(3);
   const restarted = make();
-  void mail;
-  const ra = await (async () =>
-    (
-      (await restarted.methods()["EmailSubmission/get"]!({
-        accountId: restarted.accountId,
-        ids: [sa.id, sb.id],
-      })) as any
-    ).list)();
-  expect(ra.find((x: any) => x.id === sa.id).deliveryStatus["recipient@example.test"].delivered).toBe(
-    "unknown",
-  );
-  expect(ra.find((x: any) => x.id === sb.id).undoStatus).toBe("final");
-  expect(ra.find((x: any) => x.id === sb.id).deliveryStatus).toBeNull();
-  expect(store.scheduleStats()).toMatchObject({ sent: 1, uncertain: 1, pending: 0, sending: 0 });
-  void getSub;
+  const list = (
+    (await restarted.methods()["EmailSubmission/get"]!({
+      accountId: restarted.accountId,
+      ids: [sa.id, sb.id, sc.id],
+    })) as any
+  ).list;
+  const find = (id: string) => list.find((x: any) => x.id === id);
+  expect(find(sa.id).undoStatus).toBe("pending");
+  expect(find(sb.id).undoStatus).toBe("final");
+  expect(find(sb.id).deliveryStatus).toBeNull();
+  expect(find(sc.id).deliveryStatus["recipient@example.test"].delivered).toBe("unknown");
+  expect(store.scheduleStats()).toMatchObject({ sent: 1, uncertain: 1, pending: 1, sending: 0 });
 });

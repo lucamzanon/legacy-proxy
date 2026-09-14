@@ -434,18 +434,21 @@ export class GmailStore {
       .prepare("UPDATE gmail_schedule SET status=?,reason=?,updated_at=? WHERE id=?")
       .run(status, reason, Date.now(), id);
   }
-  /** A process that died mid-send leaves entries in `sending`; their outcome is known only through the send ledger. */
+  /** A process that died mid-send leaves entries in `sending`; only the send ledger knows whether drafts.send was reached. */
   scheduleRecover(): number {
     const rows = this.db
       .prepare("SELECT * FROM gmail_schedule WHERE status='sending'")
       .all() as RawSchedule[];
     for (const row of rows) {
       const ledger = this.submission(row.email, row.original);
-      this.scheduleFinish(
-        row.id,
-        ledger?.result ? "sent" : "uncertain",
-        ledger?.result ? null : "process interrupted during send; check Sent",
-      );
+      // No intent recorded by this entry: the send never started, so the worker re-checks it (late tolerance applies).
+      if (!ledger || ledger.fingerprint !== row.id) this.scheduleRelease(row.id);
+      else
+        this.scheduleFinish(
+          row.id,
+          ledger.result ? "sent" : "uncertain",
+          ledger.result ? null : "process interrupted during send; check Sent",
+        );
     }
     return rows.length;
   }

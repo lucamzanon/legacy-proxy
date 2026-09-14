@@ -553,7 +553,11 @@ export class GmailCompose {
       try {
         await this.sendScheduled(row, now);
       } catch {
-        this.c.store.scheduleFinish(row.id, "uncertain", "unexpected error during send; check Sent");
+        // Only an entry that recorded its send intent can have reached drafts.send; earlier failures retry next tick.
+        const ledger = this.c.store.submission(this.c.email, row.original);
+        if (!ledger || ledger.fingerprint !== row.id) this.c.store.scheduleRelease(row.id);
+        else if (ledger.result) this.c.store.scheduleFinish(row.id, "sent", null);
+        else this.c.store.scheduleFinish(row.id, "uncertain", "unexpected error during send; check Sent");
       }
     }
   }
