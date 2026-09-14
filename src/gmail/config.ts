@@ -10,8 +10,11 @@ export interface GmailConfig {
   aliasesEnabled?: boolean;
   /** Delayed send queue (FUTURERELEASE). Absent = immediate sends only. */
   schedule?: { maxDelayedSend: number; lateTolerance: number };
-  /** Gmail push via Cloud Pub/Sub: `users.watch` topic and the shared secret expected on the push endpoint. */
-  push?: { topic: string; token: string };
+  /**
+   * Gmail push via Cloud Pub/Sub: the `users.watch` topic plus how the push endpoint authenticates Pub/Sub,
+   * either a Google-signed OIDC token (audience + service account) or a shared query-string secret.
+   */
+  push?: { topic: string; token?: string; audience?: string; serviceAccount?: string };
   clientId: string;
   clientSecret: string;
   redirectUri: string;
@@ -28,11 +31,24 @@ const positive = (value: string | undefined, fallback: number): number => {
   return n;
 };
 
-const pushConfig = (topic: string, token: string | undefined) => {
+const pushConfig = (
+  topic: string,
+  token: string | undefined,
+  audience: string | undefined,
+  serviceAccount: string | undefined,
+) => {
   if (!/^projects\/[a-z][-a-z0-9:.]{4,28}[a-z0-9]\/topics\/[A-Za-z][-A-Za-z0-9._~%+]{2,254}$/.test(topic))
     throw new Error("GMAIL_PUSH_TOPIC must look like projects/<project>/topics/<topic>");
+  // Authenticated push keeps secrets out of URLs and reverse-proxy access logs; prefer it when configured.
+  if (audience) {
+    if (!serviceAccount || !/^[^\s@]+@[^\s@]+$/.test(serviceAccount))
+      throw new Error("GMAIL_PUSH_SERVICE_ACCOUNT must name the service account of the push subscription");
+    return { topic, audience, serviceAccount: serviceAccount.toLowerCase() };
+  }
   if (!token || token.length < 24)
-    throw new Error("GMAIL_PUSH_TOKEN must be a secret of at least 24 characters");
+    throw new Error(
+      "GMAIL_PUSH_TOKEN must be a secret of at least 24 characters (or set GMAIL_PUSH_AUDIENCE for authenticated push)",
+    );
   return { topic, token };
 };
 
@@ -81,7 +97,14 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
         }
       : {}),
     ...(process.env.GMAIL_PUSH_TOPIC
-      ? { push: pushConfig(process.env.GMAIL_PUSH_TOPIC, process.env.GMAIL_PUSH_TOKEN) }
+      ? {
+          push: pushConfig(
+            process.env.GMAIL_PUSH_TOPIC,
+            process.env.GMAIL_PUSH_TOKEN,
+            process.env.GMAIL_PUSH_AUDIENCE,
+            process.env.GMAIL_PUSH_SERVICE_ACCOUNT,
+          ),
+        }
       : {}),
     clientId: web.client_id,
     clientSecret: web.client_secret,

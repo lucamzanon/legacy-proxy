@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { OAuth2Client } from "google-auth-library";
 import type { FastifyBaseLogger, FastifyReply, FastifyRequest } from "fastify";
 import { EventSourceHub, type StateChange } from "../jmap/eventsource.js";
 import type { AccountRow } from "../state/store.js";
@@ -9,6 +10,14 @@ const COALESCE_MS = 1_500;
 const RECOVERY_MS = 5 * 60_000;
 const RENEW_CHECK_MS = 60 * 60_000;
 const RENEW_AFTER_MS = 24 * 60 * 60_000;
+
+/** Checks the OIDC token Pub/Sub attaches to authenticated push requests. */
+export interface IdTokenVerifier {
+  verifyIdToken(options: {
+    idToken: string;
+    audience: string;
+  }): Promise<{ getPayload(): { email?: string; email_verified?: boolean } | undefined }>;
+}
 
 /** Bridges Gmail Pub/Sub notifications to the incremental sync engine and JMAP EventSource streams. */
 export class GmailPush {
@@ -22,8 +31,9 @@ export class GmailPush {
     private readonly store: GmailStore,
     private readonly account: (email: string) => GmailMail,
     private readonly allowed: ReadonlySet<string>,
-    private readonly config: { topic: string; token: string },
+    private readonly config: { topic: string; token?: string; audience?: string; serviceAccount?: string },
     private readonly log: FastifyBaseLogger,
+    private readonly verifier: IdTokenVerifier = new OAuth2Client(),
   ) {}
 
   /** SSE stream for one Gmail account. Wire format identical to the legacy hub (RFC 8620 §7.3). */
@@ -42,14 +52,9 @@ export class GmailPush {
     this.hub.add(this.row(email), reply, origin, opts);
   }
 
-  /** Pub/Sub push endpoint. The token is compared in constant time; the hint is persisted before the 204 acknowledgement. */
+  /** Pub/Sub push endpoint. Requests are authenticated before anything is read; the hint is persisted before the 204 acknowledgement. */
   async receive(req: FastifyRequest, reply: FastifyReply): Promise<void> {
-    const token = String((req.query as { token?: unknown })?.token ?? "");
-    const expected = Buffer.from(this.config.token);
-    if (
-      Buffer.byteLength(token) !== expected.length ||
-      !crypto.timingSafeEqual(Buffer.from(token), expected)
-    ) {
+    if (!(await this.authorized(req))) {
       this.counters.rejected++;
       await reply.code(401).send({ error: "unauthorized" });
       return;
@@ -73,6 +78,34 @@ export class GmailPush {
     this.store.pushRecord(email, history);
     await reply.code(204).send();
     this.schedule(email);
+  }
+
+  /**
+   * With an audience configured, only a Google-signed OIDC token for the configured service account is accepted
+   * (nothing secret appears in URLs or access logs). Otherwise the shared query token is compared in constant time.
+   */
+  private async authorized(req: FastifyRequest): Promise<boolean> {
+    if (this.config.audience) {
+      const header = req.headers.authorization ?? "";
+      if (!/^Bearer /i.test(header)) return false;
+      try {
+        const ticket = await this.verifier.verifyIdToken({
+          idToken: header.slice(7).trim(),
+          audience: this.config.audience,
+        });
+        const claims = ticket.getPayload();
+        return claims?.email_verified === true && claims.email?.toLowerCase() === this.config.serviceAccount;
+      } catch {
+        return false;
+      }
+    }
+    const token = String((req.query as { token?: unknown })?.token ?? "");
+    const expected = Buffer.from(this.config.token ?? "");
+    return (
+      expected.length > 0 &&
+      Buffer.byteLength(token) === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(token), expected)
+    );
   }
 
   /** Coalesce bursts (Gmail fans out one notification per change) into one sync per account. */

@@ -88,7 +88,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     push.start();
     app.addHook("onClose", async () => push?.stop());
   }
-  // The shared secret travels in the query string (Pub/Sub cannot set headers): never let request logging capture it, configured or not.
+  // Without authenticated push the shared secret travels in the query string: never let request logging capture it, configured or not.
   app.post("/gmail/push", { logLevel: "silent" }, async (req, reply) =>
     push ? push.receive(req, reply) : reply.code(404).send({ error: "not found" }),
   );

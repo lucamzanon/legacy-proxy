@@ -12,7 +12,7 @@ import { JmapError } from "../../src/jmap/errors.js";
 import { registerGmailBackend } from "../../src/gmail/backend.js";
 const email = "pushed@example.test";
 const TOKEN = "a-very-long-shared-secret-token-123";
-const PUSH = { topic: "projects/p/topics/gmail", token: TOKEN };
+const PUSH = { topic: "projects/bridge-test/topics/gmail", token: TOKEN };
 const labels = [
   { id: "INBOX", name: "INBOX", type: "system", messagesTotal: 1, messagesUnread: 1 },
   { id: "DRAFT", name: "DRAFT", type: "system" },
@@ -158,6 +158,78 @@ it("coalesces bursts into one sync and publishes a StateChange to open streams o
   await vi.advanceTimersByTimeAsync(2_000);
   expect(store.cursor(email)).toBe("12");
   expect(push.counters.changesPublished).toBe(1);
+});
+it("configures authenticated push from an audience and service account", async () => {
+  const { loadGmailConfig } = await import("../../src/gmail/config.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-push-config-"));
+  const file = path.join(dir, "oauth.json");
+  fs.writeFileSync(file, JSON.stringify({ web: { client_id: "id", client_secret: "secret" } }));
+  try {
+    vi.stubEnv("GMAIL_OAUTH_CLIENT_FILE", file);
+    vi.stubEnv("GMAIL_ALLOWED_EMAILS", email);
+    vi.stubEnv("GMAIL_PUSH_TOPIC", PUSH.topic);
+    vi.stubEnv("GMAIL_PUSH_TOKEN", "");
+    vi.stubEnv("GMAIL_PUSH_AUDIENCE", "https://bridge.test/gmail/push");
+    vi.stubEnv("GMAIL_PUSH_SERVICE_ACCOUNT", "");
+    expect(() => loadGmailConfig("https://bridge.test")).toThrow("GMAIL_PUSH_SERVICE_ACCOUNT");
+    vi.stubEnv("GMAIL_PUSH_SERVICE_ACCOUNT", "Push@Project.iam.gserviceaccount.com");
+    expect(loadGmailConfig("https://bridge.test")?.push).toEqual({
+      topic: PUSH.topic,
+      audience: "https://bridge.test/gmail/push",
+      serviceAccount: "push@project.iam.gserviceaccount.com",
+    });
+    vi.stubEnv("GMAIL_PUSH_AUDIENCE", "");
+    expect(() => loadGmailConfig("https://bridge.test")).toThrow("GMAIL_PUSH_TOKEN");
+  } finally {
+    vi.unstubAllEnvs();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+it("accepts authenticated Pub/Sub push only from the configured service account", async () => {
+  const { store, mail } = await setup();
+  const audience = "https://bridge.test/gmail/push";
+  const serviceAccount = "push@project.iam.gserviceaccount.com";
+  const verifier = {
+    verifyIdToken: vi.fn(async (options: { idToken: string; audience: string }) => {
+      if (options.audience !== audience || !options.idToken.startsWith("signed-"))
+        throw new Error("bad token");
+      return {
+        getPayload: () => ({
+          email: options.idToken === "signed-by-pubsub" ? serviceAccount : "someone@else.test",
+          email_verified: true,
+        }),
+      };
+    }),
+  };
+  const log = { warn: vi.fn(), error: vi.fn(), info: vi.fn() } as any;
+  const push = new GmailPush(
+    store,
+    () => mail,
+    new Set([email]),
+    { topic: PUSH.topic, audience, serviceAccount },
+    log,
+    verifier,
+  );
+  cleanup.push(() => push.stop());
+  const app = Fastify();
+  cleanup.push(() => {
+    void app.close();
+  });
+  app.post("/gmail/push", async (req, reply) => push.receive(req, reply));
+  const payload = {
+    message: {
+      data: Buffer.from(JSON.stringify({ emailAddress: email, historyId: "11" })).toString("base64"),
+    },
+  };
+  const send = (headers: Record<string, string>, url = "/gmail/push") =>
+    app.inject({ method: "POST", url, headers, payload });
+  expect((await send({}, "/gmail/push?token=" + TOKEN)).statusCode).toBe(401);
+  expect((await send({ authorization: "Bearer forged" })).statusCode).toBe(401);
+  expect((await send({ authorization: "Bearer signed-by-someone-else" })).statusCode).toBe(401);
+  expect(store.pushStats().notifications).toBe(0);
+  expect((await send({ authorization: "Bearer signed-by-pubsub" })).statusCode).toBe(204);
+  expect(store.pushStats().notifications).toBe(1);
+  expect(push.counters.rejected).toBe(3);
 });
 it("renews the watch with a read-only grant", async () => {
   const { GmailApi } = await import("../../src/gmail/api.js");
