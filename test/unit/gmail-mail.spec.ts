@@ -169,7 +169,7 @@ it("matches every word of a free-text search and excludes mailboxes", () => {
   expect(() => gmailFilter({ text: "  " }, boxes)).toThrow();
   expect(() => gmailFilter({ inMailboxOtherThan: "l_TRASH" }, boxes)).toThrow();
 });
-it("rotates bridge passwords and intercepts Gmail requests without legacy fallback", async () => {
+it("rotates bridge passwords and leaves non-bridge passwords to the legacy backend", async () => {
   const { store, mail } = setup();
   await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
   const old = store.issuePassword(email);
@@ -192,11 +192,17 @@ it("rotates bridge passwords and intercepts Gmail requests without legacy fallba
     expect(
       (await app.inject({ url: "/jmap/session", headers: { authorization: "Bearer " + old } })).statusCode,
     ).toBe(401);
+    // An IMAP app password for an allowlisted address still reaches the legacy backend.
+    const imap = await app.inject({
+      url: "/jmap/session",
+      headers: { authorization: "Basic " + Buffer.from(`${email}:app-password`).toString("base64") },
+    });
+    expect(imap.json()).toEqual({ legacy: true });
     expect(
       (
         await app.inject({
           url: "/jmap/session",
-          headers: { authorization: "Basic " + Buffer.from(`${email}:wrong`).toString("base64") },
+          headers: { authorization: "Basic " + Buffer.from(`${email}:gmap_wrong`).toString("base64") },
         })
       ).statusCode,
     ).toBe(401);

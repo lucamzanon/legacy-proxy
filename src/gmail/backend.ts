@@ -107,7 +107,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         password = decoded.slice(colon + 1);
       }
     } else if (/^Bearer /i.test(auth)) password = auth.slice(7).trim();
-    if (!password.startsWith("gmap_") && !(username && google.allowedEmails.has(username))) return;
+    // Only bridge passwords select Gmail. Anything else, such as an IMAP app password for the same
+    // address, stays with the legacy backend.
+    if (!password.startsWith("gmap_")) return;
     const email = store.authenticate(password, username);
     if (!email || !google.allowedEmails.has(email) || !store.hasConnection(email)) {
       return reply
