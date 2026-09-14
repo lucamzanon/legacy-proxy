@@ -11,15 +11,26 @@ export interface GmailProfile {
   historyId: string;
 }
 export interface GmailLabel {
-  id: string; name: string; type: string;
-  messagesTotal?: number; messagesUnread?: number; threadsTotal?: number; threadsUnread?: number;
+  id: string;
+  name: string;
+  type: string;
+  messagesTotal?: number;
+  messagesUnread?: number;
+  threadsTotal?: number;
+  threadsUnread?: number;
 }
-export interface GmailSnapshot { profile: GmailProfile; labels: GmailLabel[] }
+export interface GmailSnapshot {
+  profile: GmailProfile;
+  labels: GmailLabel[];
+}
 
 /** Separate from legacy IMAP account rows until Gmail JMAP methods are available. */
 export class GmailStore {
   private readonly db: Database.Database;
-  constructor(dataDir: string, private readonly vaultKey: Buffer) {
+  constructor(
+    dataDir: string,
+    private readonly vaultKey: Buffer,
+  ) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const file = path.join(dataDir, "gmail.sqlite3");
     // Set permissions before SQLite opens WAL/SHM sidecars.
@@ -59,75 +70,151 @@ export class GmailStore {
   }
   async save(email: string, credentials: Credentials, snapshot: GmailSnapshot): Promise<void> {
     const vault = await sealCredentials(this.vaultKey, credentials);
-    this.db.prepare(`INSERT INTO gmail_connection (email, vault, snapshot, updated_at)
+    this.db
+      .prepare(
+        `INSERT INTO gmail_connection (email, vault, snapshot, updated_at)
       VALUES (?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET
-      vault=excluded.vault, snapshot=excluded.snapshot, updated_at=excluded.updated_at`)
+      vault=excluded.vault, snapshot=excluded.snapshot, updated_at=excluded.updated_at`,
+      )
       .run(email, vault, JSON.stringify(snapshot), Date.now());
   }
   async load(email: string): Promise<{ credentials: Credentials; snapshot: GmailSnapshot } | null> {
     const row = this.db.prepare("SELECT vault, snapshot FROM gmail_connection WHERE email=?").get(email) as
-      { vault: Buffer; snapshot: string } | undefined;
+      | { vault: Buffer; snapshot: string }
+      | undefined;
     if (!row) return null;
-    return { credentials: await openCredentials(this.vaultKey, row.vault), snapshot: JSON.parse(row.snapshot) };
+    return {
+      credentials: await openCredentials(this.vaultKey, row.vault),
+      snapshot: JSON.parse(row.snapshot),
+    };
   }
-  connectedEmails(): string[] { return (this.db.prepare("SELECT email FROM gmail_connection ORDER BY email").all() as {email:string}[]).map(r=>r.email); }
+  connectedEmails(): string[] {
+    return (
+      this.db.prepare("SELECT email FROM gmail_connection ORDER BY email").all() as { email: string }[]
+    ).map((r) => r.email);
+  }
   hasConnection(email: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM gmail_connection WHERE email=?").get(email);
   }
   issuePassword(email: string): string {
     if (!this.hasConnection(email)) throw new Error("Account is not connected");
     const password = "gmap_" + crypto.randomBytes(32).toString("base64url");
-    this.db.prepare("INSERT INTO gmail_password(email,hash) VALUES (?,?) ON CONFLICT(email) DO UPDATE SET hash=excluded.hash")
+    this.db
+      .prepare(
+        "INSERT INTO gmail_password(email,hash) VALUES (?,?) ON CONFLICT(email) DO UPDATE SET hash=excluded.hash",
+      )
       .run(email, crypto.createHash("sha256").update(password).digest("hex"));
     return password;
   }
   authenticate(password: string, username?: string): string | null {
     if (!/^gmap_[A-Za-z0-9_-]{43}$/.test(password)) return null;
     const hash = crypto.createHash("sha256").update(password).digest("hex");
-    const row = this.db.prepare("SELECT email FROM gmail_password WHERE hash=?").get(hash) as { email: string } | undefined;
+    const row = this.db.prepare("SELECT email FROM gmail_password WHERE hash=?").get(hash) as
+      | { email: string }
+      | undefined;
     return row && (!username || row.email === username.toLowerCase()) ? row.email : null;
   }
-  async updateCredentials(email: string, credentials: Credentials, expectedRefreshToken?: string, snapshot?: GmailSnapshot): Promise<void> {
-    const row = this.db.prepare("SELECT vault FROM gmail_connection WHERE email=?").get(email) as { vault: Buffer } | undefined;
+  async updateCredentials(
+    email: string,
+    credentials: Credentials,
+    expectedRefreshToken?: string,
+    snapshot?: GmailSnapshot,
+  ): Promise<void> {
+    const row = this.db.prepare("SELECT vault FROM gmail_connection WHERE email=?").get(email) as
+      | { vault: Buffer }
+      | undefined;
     if (!row) return;
     const old = await openCredentials(this.vaultKey, row.vault);
-    if (old.refreshToken !== expectedRefreshToken ||
-        (snapshot === undefined && old.accessToken === credentials.accessToken && old.expiresAt === credentials.expiresAt)) return;
-    const vault = await sealCredentials(this.vaultKey, {...credentials,scopes:old.scopes});
-    this.db.prepare("UPDATE gmail_connection SET vault=?,snapshot=COALESCE(?,snapshot) WHERE email=? AND vault=?").run(vault, snapshot ? JSON.stringify(snapshot) : null, email, row.vault);
+    if (
+      old.refreshToken !== expectedRefreshToken ||
+      (snapshot === undefined &&
+        old.accessToken === credentials.accessToken &&
+        old.expiresAt === credentials.expiresAt)
+    )
+      return;
+    const vault = await sealCredentials(this.vaultKey, { ...credentials, scopes: old.scopes });
+    this.db
+      .prepare("UPDATE gmail_connection SET vault=?,snapshot=COALESCE(?,snapshot) WHERE email=? AND vault=?")
+      .run(vault, snapshot ? JSON.stringify(snapshot) : null, email, row.vault);
   }
   revision(email: string): number {
-    return (this.db.prepare("SELECT revision FROM gmail_revision WHERE email=?").get(email) as {revision:number}|undefined)?.revision ?? 0;
+    return (
+      (
+        this.db.prepare("SELECT revision FROM gmail_revision WHERE email=?").get(email) as
+          | { revision: number }
+          | undefined
+      )?.revision ?? 0
+    );
   }
   invalidate(email: string): void {
     this.db.transaction(() => {
-      this.db.prepare("INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1").run(email);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1",
+        )
+        .run(email);
       this.db.prepare("DELETE FROM gmail_cache WHERE email=?").run(email);
     })();
   }
-  cursor(email:string):string|null {return (this.db.prepare("SELECT history FROM gmail_cursor WHERE email=?").get(email) as {history:string}|undefined)?.history??null;}
-  checkpoint(email:string,history:string,messages:string[],threads:string[],reset=false):void {
-    this.db.transaction(()=>{
-      const previous=this.cursor(email);if(previous&&BigInt(previous)>=BigInt(history))return;
-      if(reset)this.invalidate(email);
-      else if(messages.length||threads.length){
-        this.db.prepare("INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1").run(email);
-        this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND (key LIKE 'page:%' OR key LIKE 'query:%' OR key LIKE 'labels:%')").run(email);
-        const del=this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?");
-        for(const id of messages)del.run(email,'message:v2:'+id);
-        for(const id of threads)del.run(email,'thread:v2:t_'+id);
+  cursor(email: string): string | null {
+    return (
+      (
+        this.db.prepare("SELECT history FROM gmail_cursor WHERE email=?").get(email) as
+          | { history: string }
+          | undefined
+      )?.history ?? null
+    );
+  }
+  checkpoint(email: string, history: string, messages: string[], threads: string[], reset = false): void {
+    this.db.transaction(() => {
+      const previous = this.cursor(email);
+      if (previous && BigInt(previous) >= BigInt(history)) return;
+      if (reset) this.invalidate(email);
+      else if (messages.length || threads.length) {
+        this.db
+          .prepare(
+            "INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1",
+          )
+          .run(email);
+        this.db
+          .prepare(
+            "DELETE FROM gmail_cache WHERE email=? AND (key LIKE 'page:%' OR key LIKE 'query:%' OR key LIKE 'labels:%')",
+          )
+          .run(email);
+        const del = this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?");
+        for (const id of messages) del.run(email, "message:v2:" + id);
+        for (const id of threads) del.run(email, "thread:v2:t_" + id);
       }
-      this.db.prepare("INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history").run(email,history);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history",
+        )
+        .run(email, history);
     })();
   }
-  mailboxSnapshot(email:string,state:string,value?:Record<string,string>):Record<string,string>|null {
-    if(value){this.db.prepare("INSERT OR IGNORE INTO gmail_mailbox_snapshot VALUES(?,?,?)").run(email,state,JSON.stringify(value));
-      this.db.prepare("DELETE FROM gmail_mailbox_snapshot WHERE email=? AND rowid NOT IN (SELECT rowid FROM gmail_mailbox_snapshot WHERE email=? ORDER BY rowid DESC LIMIT 32)").run(email,email);}
-    const row=this.db.prepare("SELECT value FROM gmail_mailbox_snapshot WHERE email=? AND state=?").get(email,state) as {value:string}|undefined;
-    return row?JSON.parse(row.value):null;
+  mailboxSnapshot(
+    email: string,
+    state: string,
+    value?: Record<string, string>,
+  ): Record<string, string> | null {
+    if (value) {
+      this.db
+        .prepare("INSERT OR IGNORE INTO gmail_mailbox_snapshot VALUES(?,?,?)")
+        .run(email, state, JSON.stringify(value));
+      this.db
+        .prepare(
+          "DELETE FROM gmail_mailbox_snapshot WHERE email=? AND rowid NOT IN (SELECT rowid FROM gmail_mailbox_snapshot WHERE email=? ORDER BY rowid DESC LIMIT 32)",
+        )
+        .run(email, email);
+    }
+    const row = this.db
+      .prepare("SELECT value FROM gmail_mailbox_snapshot WHERE email=? AND state=?")
+      .get(email, state) as { value: string } | undefined;
+    return row ? JSON.parse(row.value) : null;
   }
   cached<T>(email: string, key: string): T | null {
-    const row = this.db.prepare("SELECT value FROM gmail_cache WHERE email=? AND key=? AND expires>?")
+    const row = this.db
+      .prepare("SELECT value FROM gmail_cache WHERE email=? AND key=? AND expires>?")
       .get(email, key, Date.now()) as { value: string } | undefined;
     if (!row) return null;
     this.db.prepare("UPDATE gmail_cache SET touched=? WHERE email=? AND key=?").run(Date.now(), email, key);
@@ -139,11 +226,20 @@ export class GmailStore {
     if (size > 16 * 1024 * 1024) return;
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM gmail_cache WHERE expires<=?").run(Date.now());
-      this.db.prepare(`INSERT INTO gmail_cache(email,key,value,expires,touched,size) VALUES(?,?,?,?,?,?)
-        ON CONFLICT(email,key) DO UPDATE SET value=excluded.value,expires=excluded.expires,touched=excluded.touched,size=excluded.size`)
-        .run(email, key, value, Date.now()+ttl, Date.now(), size);
-      let total = (this.db.prepare("SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache WHERE email=?").get(email) as { n: number }).n;
-      const rows = this.db.prepare("SELECT key,size FROM gmail_cache WHERE email=? ORDER BY touched").all(email) as { key: string; size: number }[];
+      this.db
+        .prepare(
+          `INSERT INTO gmail_cache(email,key,value,expires,touched,size) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(email,key) DO UPDATE SET value=excluded.value,expires=excluded.expires,touched=excluded.touched,size=excluded.size`,
+        )
+        .run(email, key, value, Date.now() + ttl, Date.now(), size);
+      let total = (
+        this.db.prepare("SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache WHERE email=?").get(email) as {
+          n: number;
+        }
+      ).n;
+      const rows = this.db
+        .prepare("SELECT key,size FROM gmail_cache WHERE email=? ORDER BY touched")
+        .all(email) as { key: string; size: number }[];
       for (const row of rows) {
         if (total <= 256 * 1024 * 1024) break;
         this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?").run(email, row.key);
@@ -151,102 +247,319 @@ export class GmailStore {
       }
     })();
   }
-  upload(email:string,body:Buffer,type:string):string {
-    const id="gu_"+crypto.randomBytes(24).toString("base64url");
-    this.db.transaction(()=>{
+  upload(email: string, body: Buffer, type: string): string {
+    const id = "gu_" + crypto.randomBytes(24).toString("base64url");
+    this.db.transaction(() => {
       this.db.prepare("DELETE FROM gmail_upload WHERE expires<=?").run(Date.now());
-      const total=(this.db.prepare("SELECT COALESCE(SUM(length(body)),0) AS n FROM gmail_upload WHERE email=?").get(email) as {n:number}).n;
-      if(body.length>25_000_000 || total+body.length>100_000_000)throw new Error("Upload quota exceeded");
-      this.db.prepare("INSERT INTO gmail_upload VALUES(?,?,?,?,?)").run(email,id,body,type,Date.now()+24*60*60_000);
-    })();return id;
+      const total = (
+        this.db
+          .prepare("SELECT COALESCE(SUM(length(body)),0) AS n FROM gmail_upload WHERE email=?")
+          .get(email) as { n: number }
+      ).n;
+      if (body.length > 25_000_000 || total + body.length > 100_000_000)
+        throw new Error("Upload quota exceeded");
+      this.db
+        .prepare("INSERT INTO gmail_upload VALUES(?,?,?,?,?)")
+        .run(email, id, body, type, Date.now() + 24 * 60 * 60_000);
+    })();
+    return id;
   }
-  uploaded(email:string,id:string):{body:Buffer;type:string}|null {
-    return this.db.prepare("SELECT body,type FROM gmail_upload WHERE email=? AND id=? AND expires>?").get(email,id,Date.now()) as {body:Buffer;type:string}|undefined ?? null;
+  uploaded(email: string, id: string): { body: Buffer; type: string } | null {
+    return (
+      (this.db
+        .prepare("SELECT body,type FROM gmail_upload WHERE email=? AND id=? AND expires>?")
+        .get(email, id, Date.now()) as { body: Buffer; type: string } | undefined) ?? null
+    );
   }
-  rememberDraft(email:string,original:string,draft:string,current=original):void {
-    this.db.prepare("INSERT INTO gmail_draft VALUES(?,?,?,?) ON CONFLICT(email,original) DO UPDATE SET current=excluded.current,draft=excluded.draft").run(email,original,current,draft);
+  rememberDraft(email: string, original: string, draft: string, current = original): void {
+    this.db
+      .prepare(
+        "INSERT INTO gmail_draft VALUES(?,?,?,?) ON CONFLICT(email,original) DO UPDATE SET current=excluded.current,draft=excluded.draft",
+      )
+      .run(email, original, current, draft);
   }
-  draft(email:string,original:string):{current:string;draft:string}|null {
-    return this.db.prepare("SELECT current,draft FROM gmail_draft WHERE email=? AND original=?").get(email,original) as {current:string;draft:string}|undefined ?? null;
+  draft(email: string, original: string): { current: string; draft: string } | null {
+    return (
+      (this.db
+        .prepare("SELECT current,draft FROM gmail_draft WHERE email=? AND original=?")
+        .get(email, original) as { current: string; draft: string } | undefined) ?? null
+    );
   }
-  originalId(email:string,current:string):string {
-    return (this.db.prepare("SELECT original FROM gmail_draft WHERE email=? AND current=?").get(email,current) as {original:string}|undefined)?.original ?? current;
+  originalId(email: string, current: string): string {
+    return (
+      (
+        this.db
+          .prepare("SELECT original FROM gmail_draft WHERE email=? AND current=?")
+          .get(email, current) as { original: string } | undefined
+      )?.original ?? current
+    );
   }
-  upstreamId(email:string,original:string):string {return this.draft(email,original)?.current ?? original;}
-  beginSubmission(email:string,original:string,fingerprint:string):boolean {
-    return this.db.prepare("INSERT OR IGNORE INTO gmail_submission(email,original,id,fingerprint) VALUES(?,?,?,?)").run(email,original,"gs_"+crypto.randomBytes(16).toString("hex"),fingerprint).changes===1;
+  upstreamId(email: string, original: string): string {
+    return this.draft(email, original)?.current ?? original;
   }
-  submission(email:string,original:string):{id:string;fingerprint:string;result:string|null}|null {
-    return this.db.prepare("SELECT id,fingerprint,result FROM gmail_submission WHERE email=? AND original=?").get(email,original) as {id:string;fingerprint:string;result:string|null}|undefined ?? null;
+  beginSubmission(email: string, original: string, fingerprint: string): boolean {
+    return (
+      this.db
+        .prepare("INSERT OR IGNORE INTO gmail_submission(email,original,id,fingerprint) VALUES(?,?,?,?)")
+        .run(email, original, "gs_" + crypto.randomBytes(16).toString("hex"), fingerprint).changes === 1
+    );
   }
-  finishSubmission(email:string,original:string,result:unknown,current:string):void {
-    this.db.transaction(()=>{
-      this.db.prepare("UPDATE gmail_submission SET result=? WHERE email=? AND original=?").run(JSON.stringify(result),email,original);
-      this.db.prepare("UPDATE gmail_draft SET current=? WHERE email=? AND original=?").run(current,email,original);
+  submission(
+    email: string,
+    original: string,
+  ): { id: string; fingerprint: string; result: string | null } | null {
+    return (
+      (this.db
+        .prepare("SELECT id,fingerprint,result FROM gmail_submission WHERE email=? AND original=?")
+        .get(email, original) as { id: string; fingerprint: string; result: string | null } | undefined) ??
+      null
+    );
+  }
+  finishSubmission(email: string, original: string, result: unknown, current: string): void {
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE gmail_submission SET result=? WHERE email=? AND original=?")
+        .run(JSON.stringify(result), email, original);
+      this.db
+        .prepare("UPDATE gmail_draft SET current=? WHERE email=? AND original=?")
+        .run(current, email, original);
     })();
   }
-  submissionResults(email:string):Record<string,unknown>[] {
-    return (this.db.prepare("SELECT result,fingerprint FROM gmail_submission WHERE email=? AND result IS NOT NULL ORDER BY rowid DESC LIMIT 100").all(email) as {result:string;fingerprint:string}[]).map(r=>({...JSON.parse(r.result),fingerprint:r.fingerprint}));
+  submissionResults(email: string): Record<string, unknown>[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT result,fingerprint FROM gmail_submission WHERE email=? AND result IS NOT NULL ORDER BY rowid DESC LIMIT 100",
+        )
+        .all(email) as { result: string; fingerprint: string }[]
+    ).map((r) => ({ ...JSON.parse(r.result), fingerprint: r.fingerprint }));
   }
   // ── Delayed send queue ────────────────────────────────────────────
-  scheduleCreate(row:Omit<ScheduleRow,"id"|"status"|"reason"|"createdAt"|"updatedAt">):ScheduleRow {
-    const now=Date.now();const full:ScheduleRow={...row,id:"gq_"+crypto.randomBytes(16).toString("hex"),status:"pending",reason:null,createdAt:now,updatedAt:now};
-    this.db.prepare("INSERT INTO gmail_schedule(id,email,original,identity,thread,envelope,raw_hash,send_at,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(full.id,full.email,full.original,full.identity,full.thread,JSON.stringify(full.envelope),full.rawHash,full.sendAt,full.status,null,now,now);
+  scheduleCreate(
+    row: Omit<ScheduleRow, "id" | "status" | "reason" | "createdAt" | "updatedAt">,
+  ): ScheduleRow {
+    const now = Date.now();
+    const full: ScheduleRow = {
+      ...row,
+      id: "gq_" + crypto.randomBytes(16).toString("hex"),
+      status: "pending",
+      reason: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO gmail_schedule(id,email,original,identity,thread,envelope,raw_hash,send_at,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        full.id,
+        full.email,
+        full.original,
+        full.identity,
+        full.thread,
+        JSON.stringify(full.envelope),
+        full.rawHash,
+        full.sendAt,
+        full.status,
+        null,
+        now,
+        now,
+      );
     return full;
   }
-  schedule(email:string,id:string):ScheduleRow|null { const row=this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? AND id=?").get(email,id) as RawSchedule|undefined;return row?fromRaw(row):null; }
-  schedules(email:string):ScheduleRow[] { return (this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? ORDER BY send_at DESC, rowid DESC LIMIT 500").all(email) as RawSchedule[]).map(fromRaw); }
-  /** Atomic: only a pending entry can be canceled. Returns the resulting state for error mapping. */
-  scheduleCancel(email:string,id:string):"done"|"missing"|ScheduleStatus {
-    const changes=this.db.prepare("UPDATE gmail_schedule SET status='canceled',reason='canceled by client',updated_at=? WHERE email=? AND id=? AND status='pending'").run(Date.now(),email,id).changes;
-    if(changes===1)return "done";
-    return this.schedule(email,id)?.status??"missing";
+  schedule(email: string, id: string): ScheduleRow | null {
+    const row = this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? AND id=?").get(email, id) as
+      | RawSchedule
+      | undefined;
+    return row ? fromRaw(row) : null;
   }
-  scheduleDueEmails(now:number):string[] { return (this.db.prepare("SELECT DISTINCT email FROM gmail_schedule WHERE status='pending' AND send_at<=?").all(now) as {email:string}[]).map(r=>r.email); }
-  scheduleDue(email:string,now:number):ScheduleRow[] { return (this.db.prepare("SELECT * FROM gmail_schedule WHERE email=? AND status='pending' AND send_at<=? ORDER BY send_at").all(email,now) as RawSchedule[]).map(fromRaw); }
+  schedules(email: string): ScheduleRow[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM gmail_schedule WHERE email=? ORDER BY send_at DESC, rowid DESC LIMIT 500")
+        .all(email) as RawSchedule[]
+    ).map(fromRaw);
+  }
+  /** Atomic: only a pending entry can be canceled. Returns the resulting state for error mapping. */
+  scheduleCancel(email: string, id: string): "done" | "missing" | ScheduleStatus {
+    const changes = this.db
+      .prepare(
+        "UPDATE gmail_schedule SET status='canceled',reason='canceled by client',updated_at=? WHERE email=? AND id=? AND status='pending'",
+      )
+      .run(Date.now(), email, id).changes;
+    if (changes === 1) return "done";
+    return this.schedule(email, id)?.status ?? "missing";
+  }
+  scheduleDueEmails(now: number): string[] {
+    return (
+      this.db
+        .prepare("SELECT DISTINCT email FROM gmail_schedule WHERE status='pending' AND send_at<=?")
+        .all(now) as { email: string }[]
+    ).map((r) => r.email);
+  }
+  scheduleDue(email: string, now: number): ScheduleRow[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT * FROM gmail_schedule WHERE email=? AND status='pending' AND send_at<=? ORDER BY send_at",
+        )
+        .all(email, now) as RawSchedule[]
+    ).map(fromRaw);
+  }
   /** Atomic lease: exactly one worker moves an entry from pending to sending. */
-  scheduleLease(id:string):boolean { return this.db.prepare("UPDATE gmail_schedule SET status='sending',updated_at=? WHERE id=? AND status='pending'").run(Date.now(),id).changes===1; }
-  scheduleRelease(id:string):void { this.db.prepare("UPDATE gmail_schedule SET status='pending',updated_at=? WHERE id=? AND status='sending'").run(Date.now(),id); }
-  scheduleFinish(id:string,status:Exclude<ScheduleStatus,"pending"|"sending">,reason:string|null):void { this.db.prepare("UPDATE gmail_schedule SET status=?,reason=?,updated_at=? WHERE id=?").run(status,reason,Date.now(),id); }
+  scheduleLease(id: string): boolean {
+    return (
+      this.db
+        .prepare("UPDATE gmail_schedule SET status='sending',updated_at=? WHERE id=? AND status='pending'")
+        .run(Date.now(), id).changes === 1
+    );
+  }
+  scheduleRelease(id: string): void {
+    this.db
+      .prepare("UPDATE gmail_schedule SET status='pending',updated_at=? WHERE id=? AND status='sending'")
+      .run(Date.now(), id);
+  }
+  scheduleFinish(
+    id: string,
+    status: Exclude<ScheduleStatus, "pending" | "sending">,
+    reason: string | null,
+  ): void {
+    this.db
+      .prepare("UPDATE gmail_schedule SET status=?,reason=?,updated_at=? WHERE id=?")
+      .run(status, reason, Date.now(), id);
+  }
   /** A process that died mid-send leaves entries in `sending`; their outcome is known only through the send ledger. */
-  scheduleRecover():number {
-    const rows=this.db.prepare("SELECT * FROM gmail_schedule WHERE status='sending'").all() as RawSchedule[];
-    for(const row of rows){
-      const ledger=this.submission(row.email,row.original);
-      this.scheduleFinish(row.id,ledger?.result?"sent":"uncertain",ledger?.result?null:"process interrupted during send; check Sent");
+  scheduleRecover(): number {
+    const rows = this.db
+      .prepare("SELECT * FROM gmail_schedule WHERE status='sending'")
+      .all() as RawSchedule[];
+    for (const row of rows) {
+      const ledger = this.submission(row.email, row.original);
+      this.scheduleFinish(
+        row.id,
+        ledger?.result ? "sent" : "uncertain",
+        ledger?.result ? null : "process interrupted during send; check Sent",
+      );
     }
     return rows.length;
   }
-  scheduleStats():Record<ScheduleStatus,number> {
-    const stats:Record<ScheduleStatus,number>={pending:0,sending:0,sent:0,canceled:0,suspended:0,uncertain:0};
-    for(const r of this.db.prepare("SELECT status,COUNT(*) AS n FROM gmail_schedule GROUP BY status").all() as {status:ScheduleStatus;n:number}[])stats[r.status]=r.n;
+  scheduleStats(): Record<ScheduleStatus, number> {
+    const stats: Record<ScheduleStatus, number> = {
+      pending: 0,
+      sending: 0,
+      sent: 0,
+      canceled: 0,
+      suspended: 0,
+      uncertain: 0,
+    };
+    for (const r of this.db
+      .prepare("SELECT status,COUNT(*) AS n FROM gmail_schedule GROUP BY status")
+      .all() as { status: ScheduleStatus; n: number }[])
+      stats[r.status] = r.n;
     return stats;
   }
   // ── Push (Cloud Pub/Sub) ──────────────────────────────────────────
-  watchSave(email:string,expiration:number,history:string):void { this.db.prepare("INSERT INTO gmail_watch(email,expiration,history,renewed_at,failures) VALUES(?,?,?,?,0) ON CONFLICT(email) DO UPDATE SET expiration=excluded.expiration,history=excluded.history,renewed_at=excluded.renewed_at,failures=0").run(email,expiration,history,Date.now()); }
-  watchFailed(email:string):void { this.db.prepare("INSERT INTO gmail_watch(email,expiration,history,renewed_at,failures) VALUES(?,0,'',0,1) ON CONFLICT(email) DO UPDATE SET failures=failures+1").run(email); }
-  watch(email:string):{expiration:number;history:string;renewedAt:number;failures:number}|null { const r=this.db.prepare("SELECT expiration,history,renewed_at AS renewedAt,failures FROM gmail_watch WHERE email=?").get(email) as {expiration:number;history:string;renewedAt:number;failures:number}|undefined;return r??null; }
+  watchSave(email: string, expiration: number, history: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO gmail_watch(email,expiration,history,renewed_at,failures) VALUES(?,?,?,?,0) ON CONFLICT(email) DO UPDATE SET expiration=excluded.expiration,history=excluded.history,renewed_at=excluded.renewed_at,failures=0",
+      )
+      .run(email, expiration, history, Date.now());
+  }
+  watchFailed(email: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO gmail_watch(email,expiration,history,renewed_at,failures) VALUES(?,0,'',0,1) ON CONFLICT(email) DO UPDATE SET failures=failures+1",
+      )
+      .run(email);
+  }
+  watch(email: string): { expiration: number; history: string; renewedAt: number; failures: number } | null {
+    const r = this.db
+      .prepare("SELECT expiration,history,renewed_at AS renewedAt,failures FROM gmail_watch WHERE email=?")
+      .get(email) as { expiration: number; history: string; renewedAt: number; failures: number } | undefined;
+    return r ?? null;
+  }
   /** Persisted before the notification is acknowledged, so a crash never loses the hint. Returns true when the history id is newer than the last one seen. */
-  pushRecord(email:string,history:string):boolean {
-    const prev=this.db.prepare("SELECT history FROM gmail_push WHERE email=?").get(email) as {history:string}|undefined;
-    const newer=!prev||BigInt(history)>BigInt(prev.history);
-    this.db.prepare("INSERT INTO gmail_push(email,history,received_at,count) VALUES(?,?,?,1) ON CONFLICT(email) DO UPDATE SET history=CASE WHEN ? THEN excluded.history ELSE history END,received_at=excluded.received_at,count=count+1").run(email,history,Date.now(),newer?1:0);
+  pushRecord(email: string, history: string): boolean {
+    const prev = this.db.prepare("SELECT history FROM gmail_push WHERE email=?").get(email) as
+      | { history: string }
+      | undefined;
+    const newer = !prev || BigInt(history) > BigInt(prev.history);
+    this.db
+      .prepare(
+        "INSERT INTO gmail_push(email,history,received_at,count) VALUES(?,?,?,1) ON CONFLICT(email) DO UPDATE SET history=CASE WHEN ? THEN excluded.history ELSE history END,received_at=excluded.received_at,count=count+1",
+      )
+      .run(email, history, Date.now(), newer ? 1 : 0);
     return newer;
   }
-  pushStats():{watches:number;watchFailures:number;expiringSoon:number;notifications:number;lastNotificationAt:number|null} {
-    const now=Date.now();
-    const w=this.db.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(failures),0) AS f,COALESCE(SUM(CASE WHEN expiration<? THEN 1 ELSE 0 END),0) AS soon FROM gmail_watch WHERE expiration>0").get(now+2*86400_000) as {n:number;f:number;soon:number};
-    const p=this.db.prepare("SELECT COALESCE(SUM(count),0) AS n,MAX(received_at) AS last FROM gmail_push").get() as {n:number;last:number|null};
-    return {watches:w.n,watchFailures:w.f,expiringSoon:w.soon,notifications:p.n,lastNotificationAt:p.last};
+  pushStats(): {
+    watches: number;
+    watchFailures: number;
+    expiringSoon: number;
+    notifications: number;
+    lastNotificationAt: number | null;
+  } {
+    const now = Date.now();
+    const w = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n,COALESCE(SUM(failures),0) AS f,COALESCE(SUM(CASE WHEN expiration<? THEN 1 ELSE 0 END),0) AS soon FROM gmail_watch WHERE expiration>0",
+      )
+      .get(now + 2 * 86400_000) as { n: number; f: number; soon: number };
+    const p = this.db
+      .prepare("SELECT COALESCE(SUM(count),0) AS n,MAX(received_at) AS last FROM gmail_push")
+      .get() as { n: number; last: number | null };
+    return {
+      watches: w.n,
+      watchFailures: w.f,
+      expiringSoon: w.soon,
+      notifications: p.n,
+      lastNotificationAt: p.last,
+    };
   }
-  close(): void { this.db.close(); }
+  close(): void {
+    this.db.close();
+  }
 }
-export type ScheduleStatus="pending"|"sending"|"sent"|"canceled"|"suspended"|"uncertain";
+export type ScheduleStatus = "pending" | "sending" | "sent" | "canceled" | "suspended" | "uncertain";
 export interface ScheduleRow {
-  id:string;email:string;original:string;identity:string;thread:string;
-  envelope:{mailFrom:{email:string};rcptTo:{email:string}[]};rawHash:string;sendAt:number;
-  status:ScheduleStatus;reason:string|null;createdAt:number;updatedAt:number;
+  id: string;
+  email: string;
+  original: string;
+  identity: string;
+  thread: string;
+  envelope: { mailFrom: { email: string }; rcptTo: { email: string }[] };
+  rawHash: string;
+  sendAt: number;
+  status: ScheduleStatus;
+  reason: string | null;
+  createdAt: number;
+  updatedAt: number;
 }
-interface RawSchedule {id:string;email:string;original:string;identity:string;thread:string;envelope:string;raw_hash:string;send_at:number;status:ScheduleStatus;reason:string|null;created_at:number;updated_at:number}
-const fromRaw=(r:RawSchedule):ScheduleRow=>({id:r.id,email:r.email,original:r.original,identity:r.identity,thread:r.thread,envelope:JSON.parse(r.envelope),rawHash:r.raw_hash,sendAt:r.send_at,status:r.status,reason:r.reason,createdAt:r.created_at,updatedAt:r.updated_at});
+interface RawSchedule {
+  id: string;
+  email: string;
+  original: string;
+  identity: string;
+  thread: string;
+  envelope: string;
+  raw_hash: string;
+  send_at: number;
+  status: ScheduleStatus;
+  reason: string | null;
+  created_at: number;
+  updated_at: number;
+}
+const fromRaw = (r: RawSchedule): ScheduleRow => ({
+  id: r.id,
+  email: r.email,
+  original: r.original,
+  identity: r.identity,
+  thread: r.thread,
+  envelope: JSON.parse(r.envelope),
+  rawHash: r.raw_hash,
+  sendAt: r.send_at,
+  status: r.status,
+  reason: r.reason,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});

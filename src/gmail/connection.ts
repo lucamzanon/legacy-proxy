@@ -1,4 +1,9 @@
-import { OAuth2Client, CodeChallengeMethod, type Credentials as GoogleCredentials, type GenerateAuthUrlOpts } from "google-auth-library";
+import {
+  OAuth2Client,
+  CodeChallengeMethod,
+  type Credentials as GoogleCredentials,
+  type GenerateAuthUrlOpts,
+} from "google-auth-library";
 import type { Credentials } from "../auth/credentials.js";
 import { GMAIL_READONLY, GMAIL_MODIFY, type GmailConfig } from "./config.js";
 import { GmailStore, type GmailSnapshot, type GmailProfile, type GmailLabel } from "./store.js";
@@ -7,23 +12,42 @@ import { GmailStore, type GmailSnapshot, type GmailProfile, type GmailLabel } fr
 export interface GoogleClient {
   generateCodeVerifierAsync(): Promise<{ codeVerifier: string; codeChallenge?: string }>;
   generateAuthUrl(options: GenerateAuthUrlOpts): string;
-  getToken(options: { code: string; codeVerifier: string; redirect_uri: string }): Promise<{ tokens: GoogleCredentials }>;
+  getToken(options: {
+    code: string;
+    codeVerifier: string;
+    redirect_uri: string;
+  }): Promise<{ tokens: GoogleCredentials }>;
   setCredentials(credentials: GoogleCredentials): void;
   credentials: GoogleCredentials;
   getAccessToken(): Promise<unknown>;
   getTokenInfo?(token: string): Promise<{ scopes: string[] }>;
-  request<T>(options: { url: string; timeout: number; retry: boolean; method?: "GET" | "POST" | "PATCH" | "DELETE"; data?: unknown }): Promise<{ data: T }>;
+  request<T>(options: {
+    url: string;
+    timeout: number;
+    retry: boolean;
+    method?: "GET" | "POST" | "PATCH" | "DELETE";
+    data?: unknown;
+  }): Promise<{ data: T }>;
 }
 export type GoogleClientFactory = () => GoogleClient;
 
 export class GmailConnection {
   private readonly pending = new Map<string, Promise<GmailSnapshot>>();
   readonly createClient: GoogleClientFactory;
-  constructor(readonly config: GmailConfig, private readonly store: GmailStore, factory?: GoogleClientFactory) {
-    this.createClient = factory ?? (() => new OAuth2Client({
-      clientId: config.clientId, clientSecret: config.clientSecret,
-      redirectUri: config.redirectUri, transporterOptions: { timeout: 15_000, retry: false },
-    }));
+  constructor(
+    readonly config: GmailConfig,
+    private readonly store: GmailStore,
+    factory?: GoogleClientFactory,
+  ) {
+    this.createClient =
+      factory ??
+      (() =>
+        new OAuth2Client({
+          clientId: config.clientId,
+          clientSecret: config.clientSecret,
+          redirectUri: config.redirectUri,
+          transporterOptions: { timeout: 15_000, retry: false },
+        }));
   }
   async authorization(state: string): Promise<{ url: string; verifier: string }> {
     const client = this.createClient();
@@ -32,8 +56,12 @@ export class GmailConnection {
     return {
       verifier: codeVerifier,
       url: client.generateAuthUrl({
-        access_type: "offline", prompt: "consent", scope: [this.config.writeEnabled ? GMAIL_MODIFY : GMAIL_READONLY],
-        state, code_challenge: codeChallenge, code_challenge_method: CodeChallengeMethod.S256,
+        access_type: "offline",
+        prompt: "consent",
+        scope: [this.config.writeEnabled ? GMAIL_MODIFY : GMAIL_READONLY],
+        state,
+        code_challenge: codeChallenge,
+        code_challenge_method: CodeChallengeMethod.S256,
         redirect_uri: this.config.redirectUri,
       }),
     };
@@ -41,30 +69,52 @@ export class GmailConnection {
   private async snapshot(client: GoogleClient): Promise<GmailSnapshot> {
     // getProfile proves which Gmail account owns the token. Never trust a form/email hint.
     const { data: profile } = await client.request<GmailProfile>({
-      url: "https://gmail.googleapis.com/gmail/v1/users/me/profile", timeout: 15_000, retry: false,
+      url: "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+      timeout: 15_000,
+      retry: false,
     });
-    if (typeof profile.emailAddress !== "string" ||
-        !this.config.allowedEmails.has(profile.emailAddress.toLowerCase())) {
+    if (
+      typeof profile.emailAddress !== "string" ||
+      !this.config.allowedEmails.has(profile.emailAddress.toLowerCase())
+    ) {
       throw new Error("Account is not allowed");
     }
     const { data } = await client.request<{ labels?: GmailLabel[] }>({
-      url: "https://gmail.googleapis.com/gmail/v1/users/me/labels", timeout: 15_000, retry: false,
+      url: "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+      timeout: 15_000,
+      retry: false,
     });
     return { profile, labels: data.labels ?? [] };
   }
   private credentials(client: GoogleClient, email: string): Credentials {
     const c = client.credentials;
     if (!c.refresh_token) throw new Error("Google did not grant offline access; reconnect with consent");
-    return { mech: "XOAUTH2", username: email, accessToken: c.access_token ?? undefined,
-      refreshToken: c.refresh_token, expiresAt: c.expiry_date ?? undefined };
+    return {
+      mech: "XOAUTH2",
+      username: email,
+      accessToken: c.access_token ?? undefined,
+      refreshToken: c.refresh_token,
+      expiresAt: c.expiry_date ?? undefined,
+    };
   }
   /** Exchanges the code, stores the grant and returns the connected address. */
   async connect(code: string, verifier: string): Promise<string> {
     const client = this.createClient();
-    const { tokens } = await client.getToken({ code, codeVerifier: verifier, redirect_uri: this.config.redirectUri });
-    const scopes = tokens.scope?.split(" ") ?? (tokens.access_token && client.getTokenInfo
-      ? (await client.getTokenInfo(tokens.access_token)).scopes : []);
-    if (this.config.writeEnabled ? !scopes.includes(GMAIL_MODIFY) : tokens.scope && !scopes.includes(GMAIL_READONLY) && !scopes.includes(GMAIL_MODIFY))
+    const { tokens } = await client.getToken({
+      code,
+      codeVerifier: verifier,
+      redirect_uri: this.config.redirectUri,
+    });
+    const scopes =
+      tokens.scope?.split(" ") ??
+      (tokens.access_token && client.getTokenInfo
+        ? (await client.getTokenInfo(tokens.access_token)).scopes
+        : []);
+    if (
+      this.config.writeEnabled
+        ? !scopes.includes(GMAIL_MODIFY)
+        : tokens.scope && !scopes.includes(GMAIL_READONLY) && !scopes.includes(GMAIL_MODIFY)
+    )
       throw new Error("Required permission was not granted");
     client.setCredentials(tokens);
     const snapshot = await this.snapshot(client);
@@ -79,7 +129,9 @@ export class GmailConnection {
     email = email.toLowerCase();
     const existing = this.pending.get(email);
     if (existing) return existing;
-    const task = this.refresh(email).finally(() => { this.pending.delete(email); });
+    const task = this.refresh(email).finally(() => {
+      this.pending.delete(email);
+    });
     this.pending.set(email, task);
     return task;
   }
@@ -88,12 +140,20 @@ export class GmailConnection {
     const saved = await this.store.load(email);
     if (!saved) throw new Error("Account is not connected");
     const client = this.createClient();
-    client.setCredentials({ access_token: saved.credentials.accessToken, refresh_token: saved.credentials.refreshToken,
-      expiry_date: saved.credentials.expiresAt });
+    client.setCredentials({
+      access_token: saved.credentials.accessToken,
+      refresh_token: saved.credentials.refreshToken,
+      expiry_date: saved.credentials.expiresAt,
+    });
     await client.getAccessToken();
     const snapshot = await this.snapshot(client);
     if (snapshot.profile.emailAddress.toLowerCase() !== email) throw new Error("Account mismatch");
-    await this.store.updateCredentials(email, { ...this.credentials(client, email), scopes: saved.credentials.scopes }, saved.credentials.refreshToken, snapshot);
+    await this.store.updateCredentials(
+      email,
+      { ...this.credentials(client, email), scopes: saved.credentials.scopes },
+      saved.credentials.refreshToken,
+      snapshot,
+    );
     return snapshot;
   }
 }

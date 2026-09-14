@@ -18,13 +18,27 @@ export class GmailPush {
   private readonly streams = new Map<string, number>();
   private readonly timers: NodeJS.Timeout[] = [];
   readonly counters = { rejected: 0, ignored: 0, syncFailures: 0, changesPublished: 0 };
-  constructor(private readonly store: GmailStore, private readonly account: (email: string) => GmailMail,
-    private readonly allowed: ReadonlySet<string>, private readonly config: { topic: string; token: string }, private readonly log: FastifyBaseLogger) {}
+  constructor(
+    private readonly store: GmailStore,
+    private readonly account: (email: string) => GmailMail,
+    private readonly allowed: ReadonlySet<string>,
+    private readonly config: { topic: string; token: string },
+    private readonly log: FastifyBaseLogger,
+  ) {}
 
   /** SSE stream for one Gmail account. Wire format identical to the legacy hub (RFC 8620 §7.3). */
-  addStream(email: string, reply: FastifyReply, origin: string | null, opts: { types?: string[] | null; closeAfter?: boolean; pingSec?: number }): void {
+  addStream(
+    email: string,
+    reply: FastifyReply,
+    origin: string | null,
+    opts: { types?: string[] | null; closeAfter?: boolean; pingSec?: number },
+  ): void {
     this.streams.set(email, (this.streams.get(email) ?? 0) + 1);
-    reply.raw.on("close", () => { const n = (this.streams.get(email) ?? 1) - 1; if (n <= 0) this.streams.delete(email); else this.streams.set(email, n); });
+    reply.raw.on("close", () => {
+      const n = (this.streams.get(email) ?? 1) - 1;
+      if (n <= 0) this.streams.delete(email);
+      else this.streams.set(email, n);
+    });
     this.hub.add(this.row(email), reply, origin, opts);
   }
 
@@ -32,17 +46,29 @@ export class GmailPush {
   async receive(req: FastifyRequest, reply: FastifyReply): Promise<void> {
     const token = String((req.query as { token?: unknown })?.token ?? "");
     const expected = Buffer.from(this.config.token);
-    if (Buffer.byteLength(token) !== expected.length || !crypto.timingSafeEqual(Buffer.from(token), expected)) {
-      this.counters.rejected++; await reply.code(401).send({ error: "unauthorized" }); return;
+    if (
+      Buffer.byteLength(token) !== expected.length ||
+      !crypto.timingSafeEqual(Buffer.from(token), expected)
+    ) {
+      this.counters.rejected++;
+      await reply.code(401).send({ error: "unauthorized" });
+      return;
     }
     const body = req.body as { message?: { data?: unknown; messageId?: unknown } } | undefined;
     let hint: { emailAddress?: unknown; historyId?: unknown } = {};
-    try { hint = JSON.parse(Buffer.from(String(body?.message?.data ?? ""), "base64").toString("utf8")); } catch { /* malformed: acknowledge, never retry */ }
+    try {
+      hint = JSON.parse(Buffer.from(String(body?.message?.data ?? ""), "base64").toString("utf8"));
+    } catch {
+      /* malformed: acknowledge, never retry */
+    }
     const email = typeof hint.emailAddress === "string" ? hint.emailAddress.toLowerCase() : "";
-    const history = typeof hint.historyId === "string" || typeof hint.historyId === "number" ? String(hint.historyId) : "";
+    const history =
+      typeof hint.historyId === "string" || typeof hint.historyId === "number" ? String(hint.historyId) : "";
     if (!email || !/^\d+$/.test(history) || !this.allowed.has(email) || !this.store.hasConnection(email)) {
       // Unknown accounts or garbage are acknowledged so Pub/Sub stops redelivering them; nothing about them is logged.
-      this.counters.ignored++; await reply.code(204).send(); return;
+      this.counters.ignored++;
+      await reply.code(204).send();
+      return;
     }
     this.store.pushRecord(email, history);
     await reply.code(204).send();
@@ -52,12 +78,22 @@ export class GmailPush {
   /** Coalesce bursts (Gmail fans out one notification per change) into one sync per account. */
   private schedule(email: string): void {
     if (this.pending.has(email)) return;
-    this.pending.set(email, setTimeout(() => { this.pending.delete(email); void this.sync(email); }, COALESCE_MS));
+    this.pending.set(
+      email,
+      setTimeout(() => {
+        this.pending.delete(email);
+        void this.sync(email);
+      }, COALESCE_MS),
+    );
   }
 
   async sync(email: string): Promise<void> {
     const inflight = this.syncing.get(email);
-    if (inflight) { await inflight; this.schedule(email); return; } // a change may have landed after the running read started
+    if (inflight) {
+      await inflight;
+      this.schedule(email);
+      return;
+    } // a change may have landed after the running read started
     const task = (async () => {
       try {
         const mail = this.account(email);
@@ -74,7 +110,10 @@ export class GmailPush {
 
   private async publish(email: string, mail: GmailMail): Promise<void> {
     if (!this.streams.has(email)) return;
-    const change: StateChange = { "@type": "StateChange", changed: { [mail.accountId]: await mail.states() } };
+    const change: StateChange = {
+      "@type": "StateChange",
+      changed: { [mail.accountId]: await mail.states() },
+    };
     this.hub.publish(this.row(email), change);
     this.counters.changesPublished++;
   }
@@ -85,21 +124,56 @@ export class GmailPush {
       for (const email of this.store.connectedEmails()) {
         if (!this.allowed.has(email)) continue;
         const current = this.store.watch(email);
-        if (current && current.expiration > Date.now() && Date.now() - current.renewedAt < RENEW_AFTER_MS) continue;
-        try { await this.account(email).watch(this.config.topic); }
-        catch (err) { this.store.watchFailed(email); this.log.warn({ err: err instanceof Error ? err.message : String(err) }, "gmail watch renewal failed"); }
+        if (current && current.expiration > Date.now() && Date.now() - current.renewedAt < RENEW_AFTER_MS)
+          continue;
+        try {
+          await this.account(email).watch(this.config.topic);
+        } catch (err) {
+          this.store.watchFailed(email);
+          this.log.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            "gmail watch renewal failed",
+          );
+        }
       }
     };
-    const recover = async () => { for (const email of this.streams.keys()) await this.sync(email); };
+    const recover = async () => {
+      for (const email of this.streams.keys()) await this.sync(email);
+    };
     void renew();
-    this.timers.push(setInterval(() => { void renew(); }, RENEW_CHECK_MS), setInterval(() => { void recover(); }, RECOVERY_MS));
+    this.timers.push(
+      setInterval(() => {
+        void renew();
+      }, RENEW_CHECK_MS),
+      setInterval(() => {
+        void recover();
+      }, RECOVERY_MS),
+    );
     for (const t of this.timers) t.unref();
   }
-  stop(): void { for (const t of this.timers) clearInterval(t); for (const t of this.pending.values()) clearTimeout(t); this.pending.clear(); }
-  stats() { return { ...this.store.pushStats(), ...this.counters, openStreams: [...this.streams.values()].reduce((a, b) => a + b, 0) }; }
+  stop(): void {
+    for (const t of this.timers) clearInterval(t);
+    for (const t of this.pending.values()) clearTimeout(t);
+    this.pending.clear();
+  }
+  stats() {
+    return {
+      ...this.store.pushStats(),
+      ...this.counters,
+      openStreams: [...this.streams.values()].reduce((a, b) => a + b, 0),
+    };
+  }
 
   private row(email: string): AccountRow {
     // The legacy hub keys streams by numeric account id; derive a stable one from the address.
-    return { id: Number.parseInt(crypto.createHash("sha256").update(email).digest("hex").slice(0, 12), 16), slug: email, kind: "gmail", host: "", username: email, vault: Buffer.alloc(0), created_at: 0 };
+    return {
+      id: Number.parseInt(crypto.createHash("sha256").update(email).digest("hex").slice(0, 12), 16),
+      slug: email,
+      kind: "gmail",
+      host: "",
+      username: email,
+      vault: Buffer.alloc(0),
+      created_at: 0,
+    };
   }
 }

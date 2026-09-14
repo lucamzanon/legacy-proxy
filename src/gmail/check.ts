@@ -11,14 +11,22 @@ async function main(): Promise<void> {
   const store = new GmailStore(cfg.dataDir, cfg.vaultKey);
   try {
     const snapshot = await new GmailConnection(google, store).refreshSnapshot(email);
-    console.log(JSON.stringify({ connected: true, labels: snapshot.labels.length,
-      messages: snapshot.profile.messagesTotal, threads: snapshot.profile.threadsTotal }));
+    console.log(
+      JSON.stringify({
+        connected: true,
+        labels: snapshot.labels.length,
+        messages: snapshot.profile.messagesTotal,
+        threads: snapshot.profile.threadsTotal,
+      }),
+    );
   } finally {
     store.close();
   }
 }
 main().catch(() => {
   // Google errors may contain the request credentials. Never print them.
-  console.error("Gmail check failed. Verify the configuration, then reconnect if consent expired or was revoked.");
+  console.error(
+    "Gmail check failed. Verify the configuration, then reconnect if consent expired or was revoked.",
+  );
   process.exitCode = 1;
 });

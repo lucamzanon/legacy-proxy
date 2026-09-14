@@ -15,10 +15,17 @@ try {
     const fd = fs.openSync(output, "wx", 0o600);
     try {
       const password = store.issuePassword(email);
-      fs.writeFileSync(fd, JSON.stringify({ serverUrl: cfg.publicUrl, username: email, password }, null, 2) + "\n");
-    } finally { fs.closeSync(fd); }
+      fs.writeFileSync(
+        fd,
+        JSON.stringify({ serverUrl: cfg.publicUrl, username: email, password }, null, 2) + "\n",
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
     console.log("Bridge credentials saved to the requested private file. Previous bridge password revoked.");
-  } finally { store.close(); }
+  } finally {
+    store.close();
+  }
 } catch {
   console.error("Cannot issue password: supply an allowed connected email and a new writable output path.");
   process.exitCode = 1;
