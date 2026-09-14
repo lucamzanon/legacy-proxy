@@ -32,6 +32,29 @@ const ROLES: Record<string, string> = {
 const MAX_GET = 100;
 const MAX_QUERY = 100;
 const MAX_BLOB = 50_000_000;
+/** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
+const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
+  "id",
+  "threadId",
+  "blobId",
+  "mailboxIds",
+  "keywords",
+  "size",
+  "receivedAt",
+  "messageId",
+  "inReplyTo",
+  "references",
+  "sender",
+  "from",
+  "to",
+  "cc",
+  "bcc",
+  "replyTo",
+  "subject",
+  "sentAt",
+  "preview",
+  "headers",
+]);
 
 export class GmailMail {
   readonly accountId: string;
@@ -283,11 +306,17 @@ export class GmailMail {
       },
     }));
   }
-  async message(id: string): Promise<GmailMessage> {
+  /** `metadata` omits bodies and parts: enough for list views, and much smaller to transfer and cache. */
+  async message(id: string, format: "full" | "metadata" = "full"): Promise<GmailMessage> {
     id = this.store.upstreamId(this.email, id);
     await this.state();
-    return this.cached(`message:v2:${id}`, 30 * 60_000, () =>
-      this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 20, { format: "full" }),
+    if (format === "metadata") {
+      // A cached full message also answers metadata-only reads.
+      const full = this.store.cached<GmailMessage>(this.email, `message:v2:${id}`);
+      if (full) return full;
+    }
+    return this.cached(`${format === "full" ? "message" : "meta"}:v2:${id}`, 30 * 60_000, () =>
+      this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 20, { format }),
     );
   }
   private async bytes(messageId: string, part: GmailPart): Promise<Buffer> {
@@ -750,7 +779,12 @@ export class GmailMail {
       "Email/query": (a) => this.query(a),
       "Email/get": async (a) => {
         this.account(a);
-        this.properties(a);
+        const properties = this.properties(a);
+        // List views ask only for header-derived properties: Gmail's metadata format serves them without bodies.
+        const format =
+          properties && properties.every((p) => METADATA_PROPERTIES.has(p) || p.startsWith("header:"))
+            ? "metadata"
+            : "full";
         let ids = this.ids(a);
         if (ids === null) {
           if ((await this.profile()).messagesTotal > MAX_GET) throw new JmapError("requestTooLarge");
@@ -763,7 +797,7 @@ export class GmailMail {
           const batch = await Promise.all(
             ids.slice(i, i + 4).map(async (id) => {
               try {
-                const message = await this.message(upstreamId(id, "m_"));
+                const message = await this.message(upstreamId(id, "m_"), format);
                 const result = await mapMessage(message, a, (part) => this.bytes(message.id, part));
                 result.id = "m_" + this.store.originalId(this.email, message.id);
                 return result;
@@ -792,7 +826,7 @@ export class GmailMail {
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
         const state = await this.state();
-        for (const id of ids) {
+        const read = async (id: string): Promise<Record<string, unknown> | null> => {
           try {
             const revision = this.store.revision(this.email);
             const thread = await this.cached<{ id: string; messages?: GmailMessage[] }>(
@@ -807,22 +841,26 @@ export class GmailMail {
             const messages = [...(thread.messages ?? [])].sort(
               (a, b) => Number(a.internalDate) - Number(b.internalDate),
             );
-            list.push(
-              this.project(
-                { id, emailIds: messages.map((m) => "m_" + this.store.originalId(this.email, m.id)) },
-                properties,
-              ),
+            return this.project(
+              { id, emailIds: messages.map((m) => "m_" + this.store.originalId(this.email, m.id)) },
+              properties,
             );
           } catch (error) {
             if (
               error instanceof JmapError &&
               (error.type === "notFound" ||
                 (error.type === "invalidArguments" && !/^t_[A-Za-z0-9_-]{1,128}$/.test(id)))
-            )
+            ) {
               notFound.push(id);
-            else throw error;
+              return null;
+            }
+            throw error;
           }
-        }
+        };
+        // Threads are independent reads: fetch a few at a time and keep the list in request order.
+        for (let i = 0; i < ids.length; i += 4)
+          for (const record of await Promise.all(ids.slice(i, i + 4).map(read)))
+            if (record) list.push(record);
         return { accountId: this.accountId, state, list, notFound };
       },
       "Email/changes": (a) => this.emailChanges(a),

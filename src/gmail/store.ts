@@ -189,7 +189,10 @@ export class GmailStore {
           )
           .run(email);
         const del = this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?");
-        for (const id of messages) del.run(email, "message:v2:" + id);
+        for (const id of messages) {
+          del.run(email, "message:v2:" + id);
+          del.run(email, "meta:v2:" + id);
+        }
         for (const id of threads) del.run(email, "thread:v2:t_" + id);
       }
       this.db
