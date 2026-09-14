@@ -19,6 +19,11 @@ import { openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
+import { loadGmailConfig } from "./gmail/config.js";
+import { GmailStore } from "./gmail/store.js";
+import { GmailConnection } from "./gmail/connection.js";
+import { registerGmailRoutes } from "./gmail/routes.js";
+
 const cfg = loadConfig();
 const store = new Store(cfg.dataDir);
 const pool = new ImapPool(cfg, store);
@@ -58,6 +63,14 @@ await app.register(cors, { origin: true });
 await app.register(compress, { global: true, threshold: 1024 });
 
 app.get("/healthz", async () => ({ ok: true }));
+
+const gmailConfig = loadGmailConfig(cfg.publicUrl);
+if (gmailConfig) {
+  const gmailStore = new GmailStore(cfg.dataDir, cfg.vaultKey);
+  const connection = new GmailConnection(gmailConfig, gmailStore);
+  await app.register(registerGmailRoutes, { config: gmailConfig, connection });
+  app.addHook("onClose", async () => gmailStore.close());
+}
 
 app.post("/api/login", async (req, reply) => {
   const body = req.body as {
@@ -456,7 +469,7 @@ async function authn(req: {
 
 const port = cfg.port;
 app
-  .listen({ port, host: "0.0.0.0" })
+  .listen({ port, host: process.env.LISTEN_HOST ?? "0.0.0.0" })
   .then(() => log.info({ port, publicUrl: cfg.publicUrl }, "legacy-proxy listening"))
   .catch((e) => {
     log.fatal({ err: e }, "failed to listen");
