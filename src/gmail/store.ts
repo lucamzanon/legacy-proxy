@@ -30,6 +30,8 @@ export class GmailStore {
   constructor(
     dataDir: string,
     private readonly vaultKey: Buffer,
+    /** Logical bytes of cached Gmail data kept per account. */
+    private readonly cacheLimit = 256 * 1024 * 1024,
   ) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const file = path.join(dataDir, "gmail.sqlite3");
@@ -60,6 +62,8 @@ export class GmailStore {
         expires INTEGER NOT NULL, touched INTEGER NOT NULL, size INTEGER NOT NULL,
         PRIMARY KEY(email, key)
       );
+      CREATE INDEX IF NOT EXISTS gmail_cache_expires ON gmail_cache(expires);
+      CREATE INDEX IF NOT EXISTS gmail_cache_touched ON gmail_cache(email, touched);
       CREATE TABLE IF NOT EXISTS gmail_connection (
         email TEXT PRIMARY KEY,
         vault BLOB NOT NULL,
@@ -215,38 +219,51 @@ export class GmailStore {
       .get(email, state) as { value: string } | undefined;
     return row ? JSON.parse(row.value) : null;
   }
+  private lastSweep = 0;
   cached<T>(email: string, key: string): T | null {
+    const now = Date.now();
     const row = this.db
-      .prepare("SELECT value FROM gmail_cache WHERE email=? AND key=? AND expires>?")
-      .get(email, key, Date.now()) as { value: string } | undefined;
+      .prepare("SELECT value,touched FROM gmail_cache WHERE email=? AND key=? AND expires>?")
+      .get(email, key, now) as { value: string; touched: number } | undefined;
     if (!row) return null;
-    this.db.prepare("UPDATE gmail_cache SET touched=? WHERE email=? AND key=?").run(Date.now(), email, key);
+    // Recency only orders eviction: refresh it at most once a minute instead of writing on every read.
+    if (now - row.touched > 60_000)
+      this.db.prepare("UPDATE gmail_cache SET touched=? WHERE email=? AND key=?").run(now, email, key);
     return JSON.parse(row.value) as T;
   }
   cache(email: string, key: string, data: unknown, ttl: number): void {
     const value = JSON.stringify(data);
     const size = Buffer.byteLength(value);
     if (size > 16 * 1024 * 1024) return;
+    const now = Date.now();
     this.db.transaction(() => {
-      this.db.prepare("DELETE FROM gmail_cache WHERE expires<=?").run(Date.now());
+      // Sweep expired rows at most once a minute rather than on every write.
+      if (now - this.lastSweep > 60_000) {
+        this.lastSweep = now;
+        this.db.prepare("DELETE FROM gmail_cache WHERE expires<=?").run(now);
+      }
       this.db
         .prepare(
           `INSERT INTO gmail_cache(email,key,value,expires,touched,size) VALUES(?,?,?,?,?,?)
         ON CONFLICT(email,key) DO UPDATE SET value=excluded.value,expires=excluded.expires,touched=excluded.touched,size=excluded.size`,
         )
-        .run(email, key, value, Date.now() + ttl, Date.now(), size);
+        .run(email, key, value, now + ttl, now, size);
       let total = (
         this.db.prepare("SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache WHERE email=?").get(email) as {
           n: number;
         }
       ).n;
-      const rows = this.db
-        .prepare("SELECT key,size FROM gmail_cache WHERE email=? ORDER BY touched")
-        .all(email) as { key: string; size: number }[];
-      for (const row of rows) {
-        if (total <= 256 * 1024 * 1024) break;
-        this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?").run(email, row.key);
-        total -= row.size;
+      // Only an account over budget pays for finding eviction candidates, oldest first, in small batches.
+      while (total > this.cacheLimit) {
+        const oldest = this.db
+          .prepare("SELECT key,size FROM gmail_cache WHERE email=? ORDER BY touched LIMIT 64")
+          .all(email) as { key: string; size: number }[];
+        if (!oldest.length) break;
+        for (const row of oldest) {
+          if (total <= this.cacheLimit) break;
+          this.db.prepare("DELETE FROM gmail_cache WHERE email=? AND key=?").run(email, row.key);
+          total -= row.size;
+        }
       }
     })();
   }
