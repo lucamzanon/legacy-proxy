@@ -11,16 +11,25 @@ import { gmailFilter } from "../../src/gmail/filter.js";
 import { registerGmailBackend } from "../../src/gmail/backend.js";
 import { GmailConnection } from "../../src/gmail/connection.js";
 import { GmailApi } from "../../src/gmail/api.js";
-import { CORE_CAPABILITY, MAIL_CAPABILITY } from "../../src/jmap/capabilities.js";
+import {
+  CORE_CAPABILITY,
+  MAIL_CAPABILITY,
+} from "../../src/jmap/capabilities.js";
 const dirs: string[] = [];
 const stores: GmailStore[] = [];
 afterEach(() => {
   for (const s of stores.splice(0)) s.close();
-  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  for (const d of dirs.splice(0))
+    fs.rmSync(d, { recursive: true, force: true });
   vi.useRealTimers();
 });
 const email = "test@gmail.com";
-const profile = { emailAddress: email, messagesTotal: 3, threadsTotal: 2, historyId: "123" };
+const profile = {
+  emailAddress: email,
+  messagesTotal: 3,
+  threadsTotal: 2,
+  historyId: "123",
+};
 const labels = [
   {
     id: "INBOX",
@@ -43,8 +52,13 @@ const message = {
       {
         partId: "0",
         mimeType: "text/plain",
-        headers: [{ name: "Content-Type", value: "text/plain; charset=iso-8859-1" }],
-        body: { data: Buffer.from([99, 97, 102, 233]).toString("base64url"), size: 4 },
+        headers: [
+          { name: "Content-Type", value: "text/plain; charset=iso-8859-1" },
+        ],
+        body: {
+          data: Buffer.from([99, 97, 102, 233]).toString("base64url"),
+          size: 4,
+        },
       },
       {
         partId: "1",
@@ -60,84 +74,129 @@ function setup() {
   dirs.push(d);
   const store = new GmailStore(d, crypto.randomBytes(32));
   stores.push(store);
-  const get = vi.fn(async (resource: string, _cost: number, params: any = {}) => {
-    if (resource === "profile") return profile;
-    if (resource === "labels") return { labels };
-    if (resource === "labels/INBOX") return labels[0];
-    if (resource === "messages")
-      return params.pageToken
-        ? {
-            messages: [
-              { id: "b", threadId: "t1" },
-              { id: "c", threadId: "t2" },
-            ],
-            resultSizeEstimate: 900,
-          }
-        : {
-            messages: [
-              { id: "a", threadId: "t1" },
-              { id: "b", threadId: "t1" },
-            ],
-            nextPageToken: "p2",
-            resultSizeEstimate: 800,
-          };
-    if (resource === "messages/a/attachments/att") return { data: Buffer.from("PDF").toString("base64url") };
-    if (resource === "messages/a") return message;
-    throw Error("Unexpected fixture resource");
-  });
+  const get = vi.fn(
+    async (resource: string, _cost: number, params: any = {}) => {
+      if (resource === "profile") return profile;
+      if (resource === "labels") return { labels };
+      if (resource === "labels/INBOX") return labels[0];
+      if (resource === "messages")
+        return params.pageToken
+          ? {
+              messages: [
+                { id: "b", threadId: "t1" },
+                { id: "c", threadId: "t2" },
+              ],
+              resultSizeEstimate: 900,
+            }
+          : {
+              messages: [
+                { id: "a", threadId: "t1" },
+                { id: "b", threadId: "t1" },
+              ],
+              nextPageToken: "p2",
+              resultSizeEstimate: 800,
+            };
+      if (resource === "messages/a/attachments/att")
+        return { data: Buffer.from("PDF").toString("base64url") };
+      if (resource === "messages/a") return message;
+      throw Error("Unexpected fixture resource");
+    },
+  );
   const mail = new GmailMail(email, { get } as any, store);
   return { store, mail, get };
 }
 it("paginates exact IDs, de-duplicates pages, reverses and collapses threads, reuses cache", async () => {
   const { mail, get } = setup();
   const q = mail.methods()["Email/query"]!;
-  const a = { accountId: mail.accountId, calculateTotal: true, filter: { subject: "test" } };
-  expect(await q({ ...a, limit: 2 })).toMatchObject({ ids: ["m_a", "m_b"], total: 3 });
-  expect(await q({ ...a, position: 2 })).toMatchObject({ ids: ["m_c"], total: 3 });
-  expect(await q({ ...a, collapseThreads: true })).toMatchObject({ ids: ["m_a", "m_c"], total: 2 });
+  const a = {
+    accountId: mail.accountId,
+    calculateTotal: true,
+    filter: { subject: "test" },
+  };
+  expect(await q({ ...a, limit: 2 })).toMatchObject({
+    ids: ["m_a", "m_b"],
+    total: 3,
+  });
+  expect(await q({ ...a, position: 2 })).toMatchObject({
+    ids: ["m_c"],
+    total: 3,
+  });
+  expect(await q({ ...a, collapseThreads: true })).toMatchObject({
+    ids: ["m_a", "m_c"],
+    total: 2,
+  });
   expect(
-    await q({ ...a, sort: [{ property: "receivedAt", isAscending: true }], anchor: "m_b", anchorOffset: 1 }),
+    await q({
+      ...a,
+      sort: [{ property: "receivedAt", isAscending: true }],
+      anchor: "m_b",
+      anchorOffset: 1,
+    }),
   ).toMatchObject({ ids: ["m_a"], position: 2 });
   expect(get.mock.calls.filter((c) => c[0] === "messages")).toHaveLength(2);
-  await expect(q({ ...a, sort: [{ property: "subject" }] })).rejects.toMatchObject({
+  await expect(
+    q({ ...a, sort: [{ property: "subject" }] }),
+  ).rejects.toMatchObject({
     type: "unsupportedSort",
   });
-  await expect(q({ ...a, anchor: "missing" })).rejects.toMatchObject({ type: "anchorNotFound" });
+  await expect(q({ ...a, anchor: "missing" })).rejects.toMatchObject({
+    type: "anchorNotFound",
+  });
 });
 it("maps labels, charset, immutable part blobs, truncation and attachments", async () => {
   const get = vi.fn(async (p: any) => Buffer.from(p.body.data, "base64url"));
-  const result = await mapMessage(message, { fetchTextBodyValues: true, maxBodyValueBytes: 4 }, get);
+  const result = await mapMessage(
+    message,
+    { fetchTextBodyValues: true, maxBodyValueBytes: 4 },
+    get,
+  );
   expect(result).toMatchObject({
     id: "m_a",
     threadId: "t_t1",
     mailboxIds: { all: true, l_INBOX: true, l_Label_1: true },
     keywords: {},
     hasAttachment: true,
-    bodyValues: { "0": { value: "caf", isTruncated: true, isEncodingProblem: false } },
+    bodyValues: {
+      "0": { value: "caf", isTruncated: true, isEncodingProblem: false },
+    },
   });
-  expect((result.attachments as any[])[0]).toMatchObject({ name: "test.pdf", blobId: blobId("a", "1") });
+  expect((result.attachments as any[])[0]).toMatchObject({
+    name: "test.pdf",
+    blobId: blobId("a", "1"),
+  });
   expect(get).toHaveBeenCalledTimes(1);
 });
 it("downloads attachment bytes and scopes cache entries by account", async () => {
   const { mail, store, get } = setup();
   expect((await mail.download(blobId("a", "1"))).body.toString()).toBe("PDF");
   await mail.download(blobId("a", "1"));
-  expect(get.mock.calls.filter((c) => c[0].includes("attachments"))).toHaveLength(1);
+  expect(
+    get.mock.calls.filter((c) => c[0].includes("attachments")),
+  ).toHaveLength(1);
   expect(store.cached("other@gmail.com", "profile")).toBeNull();
 });
 it("rejects other accounts and writes, invalidates mailbox state on label changes", async () => {
   const { mail, store } = setup();
   const methods = mail.methods();
-  await expect(methods["Email/get"]!({ accountId: "other", ids: [] })).rejects.toMatchObject({
+  await expect(
+    methods["Email/get"]!({ accountId: "other", ids: [] }),
+  ).rejects.toMatchObject({
     type: "accountNotFound",
   });
-  await expect(methods["Email/set"]!({ accountId: mail.accountId })).rejects.toMatchObject({
+  await expect(
+    methods["Email/set"]!({ accountId: mail.accountId }),
+  ).rejects.toMatchObject({
     type: "accountReadOnly",
   });
   const old = await mail.mailboxState();
   store.cache(email, "labels:g123", [{ ...labels[0], name: "renamed" }], 60000);
   expect(await mail.mailboxState()).not.toBe(old);
-  expect(await methods["Mailbox/changes"]!({ accountId: mail.accountId, sinceState: old })).toMatchObject({
+  expect(
+    await methods["Mailbox/changes"]!({
+      accountId: mail.accountId,
+      sinceState: old,
+    }),
+  ).toMatchObject({
     updated: ["l_INBOX"],
     created: [],
     destroyed: [],
@@ -145,7 +204,13 @@ it("rejects other accounts and writes, invalidates mailbox state on label change
 });
 it("filters only supported Gmail searches", () => {
   expect(
-    gmailFilter({ operator: "AND", conditions: [{ inMailbox: "l_INBOX" }, { notKeyword: "$seen" }] }, labels),
+    gmailFilter(
+      {
+        operator: "AND",
+        conditions: [{ inMailbox: "l_INBOX" }, { notKeyword: "$seen" }],
+      },
+      labels,
+    ),
   ).toBe("(in:inbox) (-(-is:unread))");
   expect(() => gmailFilter({ unsupported: true }, labels)).toThrow();
   expect(() => gmailFilter({ subject: "test\nquery" }, labels)).toThrow();
@@ -161,48 +226,89 @@ it("matches every word of a free-text search and excludes mailboxes", () => {
   );
   expect(
     gmailFilter(
-      { operator: "AND", conditions: [{ text: "x" }, { inMailboxOtherThan: ["l_TRASH", "l_SPAM"] }] },
+      {
+        operator: "AND",
+        conditions: [
+          { text: "x" },
+          { inMailboxOtherThan: ["l_TRASH", "l_SPAM"] },
+        ],
+      },
       boxes,
     ),
   ).toBe('("x") (-(in:trash) -(in:spam))');
-  expect(gmailFilter({ inMailboxOtherThan: ["all"] }, boxes)).toBe("in:anywhere -in:anywhere");
+  expect(gmailFilter({ inMailboxOtherThan: ["all"] }, boxes)).toBe(
+    "in:anywhere -in:anywhere",
+  );
   expect(() => gmailFilter({ text: "  " }, boxes)).toThrow();
   expect(() => gmailFilter({ inMailboxOtherThan: "l_TRASH" }, boxes)).toThrow();
 });
 it("rotates bridge passwords and leaves non-bridge passwords to the legacy backend", async () => {
   const { store, mail } = setup();
-  await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+    { profile, labels },
+  );
   const old = store.issuePassword(email);
   const password = store.issuePassword(email);
   expect(store.authenticate(old)).toBeNull();
   expect(store.authenticate(password, "other@gmail.com")).toBeNull();
   const app = Fastify();
-  const cfg: any = { publicUrl: "https://bridge.test", limits: { maxCallsInRequest: 10 } };
+  const cfg: any = {
+    publicUrl: "https://bridge.test",
+    limits: { maxCallsInRequest: 10 },
+  };
   const google: any = { allowedEmails: new Set([email]) };
-  registerGmailBackend(app, cfg, google, store, new GmailConnection(google, store), () => mail);
+  registerGmailBackend(
+    app,
+    cfg,
+    google,
+    store,
+    new GmailConnection(google, store),
+    () => mail,
+  );
   app.get("/jmap/session", async () => ({ legacy: true }));
   app.post("/jmap", async () => ({ legacy: true }));
-  app.get("/jmap/download/:accountId/:blobId/:type/:name", async () => ({ legacy: true }));
+  app.get("/jmap/download/:accountId/:blobId/:type/:name", async () => ({
+    legacy: true,
+  }));
   try {
-    const authorization = "Basic " + Buffer.from(`${email}:${password}`).toString("base64");
-    const session = await app.inject({ url: "/jmap/session", headers: { authorization } });
+    const authorization =
+      "Basic " + Buffer.from(`${email}:${password}`).toString("base64");
+    const session = await app.inject({
+      url: "/jmap/session",
+      headers: { authorization },
+    });
     expect(session.statusCode).toBe(200);
     expect(session.json().accounts[mail.accountId].isReadOnly).toBe(true);
-    expect(session.json().capabilities["urn:ietf:params:jmap:submission"]).toBeUndefined();
     expect(
-      (await app.inject({ url: "/jmap/session", headers: { authorization: "Bearer " + old } })).statusCode,
+      session.json().capabilities["urn:ietf:params:jmap:submission"],
+    ).toBeUndefined();
+    expect(
+      (
+        await app.inject({
+          url: "/jmap/session",
+          headers: { authorization: "Bearer " + old },
+        })
+      ).statusCode,
     ).toBe(401);
     // An IMAP app password for an allowlisted address still reaches the legacy backend.
     const imap = await app.inject({
       url: "/jmap/session",
-      headers: { authorization: "Basic " + Buffer.from(`${email}:app-password`).toString("base64") },
+      headers: {
+        authorization:
+          "Basic " + Buffer.from(`${email}:app-password`).toString("base64"),
+      },
     });
     expect(imap.json()).toEqual({ legacy: true });
     expect(
       (
         await app.inject({
           url: "/jmap/session",
-          headers: { authorization: "Basic " + Buffer.from(`${email}:gmap_wrong`).toString("base64") },
+          headers: {
+            authorization:
+              "Basic " + Buffer.from(`${email}:gmap_wrong`).toString("base64"),
+          },
         })
       ).statusCode,
     ).toBe(401);
@@ -215,7 +321,11 @@ it("rotates bridge passwords and leaves non-bridge passwords to the legacy backe
         methodCalls: [["Email/set", { accountId: mail.accountId }, "a"]],
       },
     });
-    expect(r.json().methodResponses[0]).toMatchObject(["error", { type: "accountReadOnly" }, "a"]);
+    expect(r.json().methodResponses[0]).toMatchObject([
+      "error",
+      { type: "accountReadOnly" },
+      "a",
+    ]);
     expect(
       (
         await app.inject({
@@ -240,7 +350,11 @@ it("rotates bridge passwords and leaves non-bridge passwords to the legacy backe
 });
 it("sanitizes Google errors before they reach JMAP or logs", async () => {
   const { store } = setup();
-  await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+    { profile, labels },
+  );
   const client: any = {
     credentials: {},
     setCredentials(c: any) {
@@ -252,7 +366,9 @@ it("sanitizes Google errors before they reach JMAP or logs", async () => {
     },
   };
   const connection: any = { createClient: () => client };
-  await expect(new GmailApi(email, connection, store).get("profile", 1)).rejects.toMatchObject({
+  await expect(
+    new GmailApi(email, connection, store).get("profile", 1),
+  ).rejects.toMatchObject({
     type: "serverUnavailable",
     message:
       "Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.",
@@ -276,7 +392,15 @@ it("lists a folder page by label id instead of a label-name search", async () =>
   store.cache(
     email,
     "labels:g123",
-    [...labels, { id: "Label_1", name: "Work / Q&A (2026)", type: "user", messagesTotal: 2 }],
+    [
+      ...labels,
+      {
+        id: "Label_1",
+        name: "Work / Q&A (2026)",
+        type: "user",
+        messagesTotal: 2,
+      },
+    ],
     60_000,
   );
   const result = await mail.methods()["Email/query"]!({
@@ -287,12 +411,19 @@ it("lists a folder page by label id instead of a label-name search", async () =>
   });
   expect(result).toMatchObject({ ids: ["m_a", "m_b"], total: 2 });
   const listing = get.mock.calls.find((c) => c[0] === "messages")!;
-  expect(listing[2]).toMatchObject({ labelIds: "Label_1", includeSpamTrash: "true" });
+  expect(listing[2]).toMatchObject({
+    labelIds: "Label_1",
+    includeSpamTrash: "true",
+  });
   expect(listing[2]).not.toHaveProperty("q");
 });
 it("treats unmapped client keywords as absent", () => {
-  expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe("in:anywhere -in:anywhere");
-  expect(gmailFilter({ notKeyword: "$pinned" }, labels)).toBe("-(in:anywhere -in:anywhere)");
+  expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe(
+    "in:anywhere -in:anywhere",
+  );
+  expect(gmailFilter({ notKeyword: "$pinned" }, labels)).toBe(
+    "-(in:anywhere -in:anywhere)",
+  );
 });
 it("de-duplicates overlapping native folder pages before calculating offsets", async () => {
   const { mail, get } = setup();
@@ -315,14 +446,20 @@ it("returns malformed thread IDs in notFound without contacting Google", async (
 });
 it("treats malformed blob IDs as missing downloads", async () => {
   const { mail, get } = setup();
-  await expect(mail.download("gb_invalid")).rejects.toMatchObject({ type: "notFound" });
+  await expect(mail.download("gb_invalid")).rejects.toMatchObject({
+    type: "notFound",
+  });
   expect(get).not.toHaveBeenCalled();
 });
 it.each([429, 503, "rateLimitExceeded"])(
   "retries temporary Google failure %s, preserving secret redaction",
   async (kind) => {
     const { store } = setup();
-    await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+    await store.save(
+      email,
+      { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+      { profile, labels },
+    );
     vi.useFakeTimers();
     const request = vi
       .fn()
@@ -343,7 +480,11 @@ it.each([429, 503, "rateLimitExceeded"])(
       getAccessToken: async () => {},
       request,
     };
-    const promise = new GmailApi(email, { createClient: () => client } as any, store).get("profile", 1);
+    const promise = new GmailApi(
+      email,
+      { createClient: () => client } as any,
+      store,
+    ).get("profile", 1);
     await vi.runAllTimersAsync();
     expect(await promise).toEqual(profile);
     expect(request).toHaveBeenCalledTimes(2);
@@ -351,10 +492,17 @@ it.each([429, 503, "rateLimitExceeded"])(
 );
 it("does not retry permanent Google permission errors", async () => {
   const { store } = setup();
-  await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+    { profile, labels },
+  );
   const request = vi.fn().mockRejectedValue({
     message: "SECRET",
-    response: { status: 403, data: { error: { errors: [{ reason: "domainPolicy" }] } } },
+    response: {
+      status: 403,
+      data: { error: { errors: [{ reason: "domainPolicy" }] } },
+    },
   });
   const client: any = {
     credentials: {},
@@ -365,16 +513,27 @@ it("does not retry permanent Google permission errors", async () => {
     request,
   };
   await expect(
-    new GmailApi(email, { createClient: () => client } as any, store).get("profile", 1),
-  ).rejects.toMatchObject({ message: "Google denied access; verify account permissions" });
+    new GmailApi(email, { createClient: () => client } as any, store).get(
+      "profile",
+      1,
+    ),
+  ).rejects.toMatchObject({
+    message: "Google denied access; verify account permissions",
+  });
   expect(request).toHaveBeenCalledTimes(1);
 });
 it("bounds retries and honors long Retry-After without holding a request open", async () => {
   const { store } = setup();
-  await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+    { profile, labels },
+  );
   const request = vi
     .fn()
-    .mockRejectedValue({ response: { status: 429, headers: new Headers({ "retry-after": "60" }) } });
+    .mockRejectedValue({
+      response: { status: 429, headers: new Headers({ "retry-after": "60" }) },
+    });
   const client: any = {
     credentials: {},
     setCredentials(c: any) {
@@ -384,15 +543,25 @@ it("bounds retries and honors long Retry-After without holding a request open", 
     request,
   };
   const api = new GmailApi(email, { createClient: () => client } as any, store);
-  await expect(api.get("profile", 1)).rejects.toMatchObject({ message: "Google rate limit; retry later" });
-  await expect(api.get("profile", 1)).rejects.toMatchObject({ type: "serverUnavailable" });
+  await expect(api.get("profile", 1)).rejects.toMatchObject({
+    message: "Google rate limit; retry later",
+  });
+  await expect(api.get("profile", 1)).rejects.toMatchObject({
+    type: "serverUnavailable",
+  });
   expect(request).toHaveBeenCalledTimes(1);
 });
 it("stops after three attempts on a persistent Google outage", async () => {
   const { store } = setup();
-  await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+    { profile, labels },
+  );
   vi.useFakeTimers();
-  const request = vi.fn().mockRejectedValue({ message: "SECRET", response: { status: 503 } });
+  const request = vi
+    .fn()
+    .mockRejectedValue({ message: "SECRET", response: { status: 503 } });
   const client: any = {
     credentials: {},
     setCredentials(c: any) {
@@ -402,15 +571,24 @@ it("stops after three attempts on a persistent Google outage", async () => {
     request,
   };
   const result = expect(
-    new GmailApi(email, { createClient: () => client } as any, store).get("profile", 1),
-  ).rejects.toMatchObject({ message: "Google temporarily unavailable; retry later" });
+    new GmailApi(email, { createClient: () => client } as any, store).get(
+      "profile",
+      1,
+    ),
+  ).rejects.toMatchObject({
+    message: "Google temporarily unavailable; retry later",
+  });
   await vi.runAllTimersAsync();
   await result;
   expect(request).toHaveBeenCalledTimes(3);
 });
 it("applies a rate-limit cooldown to requests already waiting for their slot", async () => {
   const { store } = setup();
-  await store.save(email, { mech: "XOAUTH2", username: email, refreshToken: "fake" }, { profile, labels });
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "fake" },
+    { profile, labels },
+  );
   vi.useFakeTimers();
   const times: number[] = [];
   const request = vi.fn(async () => {
@@ -431,4 +609,42 @@ it("applies a rate-limit cooldown to requests already waiting for their slot", a
   await vi.runAllTimersAsync();
   expect(await results).toEqual([profile, profile]);
   expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(1000);
+});
+
+it("finds the inbox by role so push previews work, and rejects unknown mailbox filters", async () => {
+  const f = await setup();
+  const call = (filter: unknown) =>
+    f.mail.methods()["Mailbox/query"]!({
+      accountId: f.mail.accountId,
+      filter,
+    }) as Promise<{ ids: string[] }>;
+  const all = (await call(null)).ids;
+  expect(all.length).toBeGreaterThan(1);
+  const inbox = await call({ role: "inbox" });
+  expect(inbox.ids).toEqual(["l_INBOX"]);
+  expect(
+    (await call({ role: null })).ids.every(
+      (id) => !["l_INBOX", "l_SENT"].includes(id),
+    ),
+  ).toBe(true);
+  expect((await call({ hasAnyRole: true })).ids).toContain("l_INBOX");
+  expect(
+    (
+      await call({
+        operator: "AND",
+        conditions: [{ role: "inbox" }, { name: "IN" }],
+      })
+    ).ids,
+  ).toEqual(["l_INBOX"]);
+  expect(
+    (await call({ operator: "NOT", conditions: [{ role: "inbox" }] })).ids,
+  ).not.toContain("l_INBOX");
+  // Gmail labels are flat: a child query is empty rather than wrong.
+  expect((await call({ parentId: "l_INBOX" })).ids).toEqual([]);
+  await expect(call({ isSubscribed: "yes" })).rejects.toMatchObject({
+    type: "invalidArguments",
+  });
+  await expect(call({ sortOrder: 1 })).rejects.toMatchObject({
+    type: "unsupportedFilter",
+  });
 });

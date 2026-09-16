@@ -23,7 +23,7 @@ import {
   type GmailMessage,
   type GmailPart,
 } from "./message.js";
-import { gmailFilter } from "./filter.js";
+import { gmailFilter, mailboxFilter } from "./filter.js";
 import {
   JmapError,
   accountNotFound,
@@ -1018,12 +1018,12 @@ export class GmailMail {
       },
       "Mailbox/query": async (a) => {
         this.account(a);
-        if (a.filter != null || a.sort != null)
+        if (a.sort != null)
           throw new JmapError(
-            "unsupportedFilter",
-            "Mailbox query filters are not supported yet",
+            "unsupportedSort",
+            "Mailbox query sorting is not supported yet",
           );
-        const records = await this.mailboxes();
+        const records = mailboxFilter(await this.mailboxes(), a.filter);
         const position = a.position ?? 0;
         const limit = a.limit ?? MAX_GET;
         if (

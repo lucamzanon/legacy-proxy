@@ -570,6 +570,11 @@ only; `EmailDelivery` fires exclusively for genuine arrivals, so label changes,
 sends, drafts and anything Gmail files into Spam or Trash stay silent. When a
 history record omits labels the bridge asks Gmail rather than guess. Endpoints
 answering 404/410, or failing eight times in a row, are dropped.
+
+`Mailbox/query` accepts the standard filters (`role`, `hasAnyRole`, `name`,
+`parentId`, `isSubscribed`) so a client can resolve the Inbox by role. Webmails
+do this when building a notification preview; rejecting the filter reads to them
+as "this account has no Inbox" and silences notifications.
 Ordinary newest-first folder pages list by label id, use exact label/profile counts
 and fetch only the required ID pages. Searches, oldest-first ordering, anchors and
 collapsed thread queries enumerate matching IDs before slicing, which can be slow on
