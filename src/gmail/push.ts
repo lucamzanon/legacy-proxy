@@ -16,7 +16,9 @@ export interface IdTokenVerifier {
   verifyIdToken(options: {
     idToken: string;
     audience: string;
-  }): Promise<{ getPayload(): { email?: string; email_verified?: boolean } | undefined }>;
+  }): Promise<{
+    getPayload(): { email?: string; email_verified?: boolean } | undefined;
+  }>;
 }
 
 /** Bridges Gmail Pub/Sub notifications to the incremental sync engine and JMAP EventSource streams. */
@@ -26,12 +28,23 @@ export class GmailPush {
   private readonly syncing = new Map<string, Promise<void>>();
   private readonly streams = new Map<string, number>();
   private readonly timers: NodeJS.Timeout[] = [];
-  readonly counters = { rejected: 0, ignored: 0, syncFailures: 0, changesPublished: 0 };
+  readonly counters = {
+    rejected: 0,
+    ignored: 0,
+    syncFailures: 0,
+    changesPublished: 0,
+    notificationsSent: 0,
+  };
   constructor(
     private readonly store: GmailStore,
     private readonly account: (email: string) => GmailMail,
     private readonly allowed: { has(email: string): boolean },
-    private readonly config: { topic: string; token?: string; audience?: string; serviceAccount?: string },
+    private readonly config: {
+      topic: string;
+      token?: string;
+      audience?: string;
+      serviceAccount?: string;
+    },
     private readonly log: FastifyBaseLogger,
     private readonly verifier: IdTokenVerifier = new OAuth2Client(),
   ) {}
@@ -59,17 +72,32 @@ export class GmailPush {
       await reply.code(401).send({ error: "unauthorized" });
       return;
     }
-    const body = req.body as { message?: { data?: unknown; messageId?: unknown } } | undefined;
+    const body = req.body as
+      { message?: { data?: unknown; messageId?: unknown } } | undefined;
     let hint: { emailAddress?: unknown; historyId?: unknown } = {};
     try {
-      hint = JSON.parse(Buffer.from(String(body?.message?.data ?? ""), "base64").toString("utf8"));
+      hint = JSON.parse(
+        Buffer.from(String(body?.message?.data ?? ""), "base64").toString(
+          "utf8",
+        ),
+      );
     } catch {
       /* malformed: acknowledge, never retry */
     }
-    const email = typeof hint.emailAddress === "string" ? hint.emailAddress.toLowerCase() : "";
+    const email =
+      typeof hint.emailAddress === "string"
+        ? hint.emailAddress.toLowerCase()
+        : "";
     const history =
-      typeof hint.historyId === "string" || typeof hint.historyId === "number" ? String(hint.historyId) : "";
-    if (!email || !/^\d+$/.test(history) || !this.allowed.has(email) || !this.store.hasConnection(email)) {
+      typeof hint.historyId === "string" || typeof hint.historyId === "number"
+        ? String(hint.historyId)
+        : "";
+    if (
+      !email ||
+      !/^\d+$/.test(history) ||
+      !this.allowed.has(email) ||
+      !this.store.hasConnection(email)
+    ) {
       // Unknown accounts or garbage are acknowledged so Pub/Sub stops redelivering them; nothing about them is logged.
       this.counters.ignored++;
       await reply.code(204).send();
@@ -94,7 +122,10 @@ export class GmailPush {
           audience: this.config.audience,
         });
         const claims = ticket.getPayload();
-        return claims?.email_verified === true && claims.email?.toLowerCase() === this.config.serviceAccount;
+        return (
+          claims?.email_verified === true &&
+          claims.email?.toLowerCase() === this.config.serviceAccount
+        );
       } catch {
         return false;
       }
@@ -130,25 +161,42 @@ export class GmailPush {
     const task = (async () => {
       try {
         const mail = this.account(email);
-        const changed = await mail.pushSync();
-        if (changed) await this.publish(email, mail);
+        const { changed, delivered } = await mail.pushSync();
+        if (changed || delivered)
+          await this.publish(email, mail, delivered > 0);
       } catch (err) {
         this.counters.syncFailures++;
-        this.log.warn({ err: err instanceof Error ? err.message : String(err) }, "gmail push sync failed");
+        this.log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          "gmail push sync failed",
+        );
       }
     })().finally(() => this.syncing.delete(email));
     this.syncing.set(email, task);
     await task;
   }
 
-  private async publish(email: string, mail: GmailMail): Promise<void> {
-    if (!this.streams.has(email)) return;
-    const change: StateChange = {
-      "@type": "StateChange",
-      changed: { [mail.accountId]: await mail.states() },
-    };
-    this.hub.publish(this.row(email), change);
-    this.counters.changesPublished++;
+  private async publish(
+    email: string,
+    mail: GmailMail,
+    delivered: boolean,
+  ): Promise<void> {
+    const states = await mail.states(delivered);
+    if (this.streams.has(email)) {
+      // Open tabs refresh from the other states; EmailDelivery exists for woken devices.
+      const { EmailDelivery: _delivery, ...live } = states;
+      const change: StateChange = {
+        "@type": "StateChange",
+        changed: { [mail.accountId]: live },
+      };
+      this.hub.publish(this.row(email), change);
+      this.counters.changesPublished++;
+    }
+    // Verified Web Push subscriptions fire with every tab closed.
+    this.counters.notificationsSent += await mail.subscriptions.publish(
+      mail.accountId,
+      states,
+    );
   }
 
   /** Renew watches daily (Google stops after 7 days) and poll open streams as a safety net for lost notifications. */
@@ -157,7 +205,11 @@ export class GmailPush {
       for (const email of this.store.connectedEmails()) {
         if (!this.allowed.has(email)) continue;
         const current = this.store.watch(email);
-        if (current && current.expiration > Date.now() && Date.now() - current.renewedAt < RENEW_AFTER_MS)
+        if (
+          current &&
+          current.expiration > Date.now() &&
+          Date.now() - current.renewedAt < RENEW_AFTER_MS
+        )
           continue;
         try {
           await this.account(email).watch(this.config.topic);
@@ -192,6 +244,7 @@ export class GmailPush {
   stats() {
     return {
       ...this.store.pushStats(),
+      ...this.store.subscriptionStats(),
       ...this.counters,
       openStreams: [...this.streams.values()].reduce((a, b) => a + b, 0),
     };
@@ -200,7 +253,10 @@ export class GmailPush {
   private row(email: string): AccountRow {
     // The legacy hub keys streams by numeric account id; derive a stable one from the address.
     return {
-      id: Number.parseInt(crypto.createHash("sha256").update(email).digest("hex").slice(0, 12), 16),
+      id: Number.parseInt(
+        crypto.createHash("sha256").update(email).digest("hex").slice(0, 12),
+        16,
+      ),
       slug: email,
       kind: "gmail",
       host: "",

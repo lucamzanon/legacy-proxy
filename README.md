@@ -557,6 +557,19 @@ also re-synced every 5 minutes as a safety net for notifications Google delays o
 drops. `/healthz` reports watches, renewal failures, notification counts and open
 streams; addresses and message contents are never logged.
 
+
+With push configured the backend also accepts `PushSubscription/get` and
+`PushSubscription/set` (RFC 8620 §7.2), which is what a webmail needs for system
+notifications while every tab is closed. A subscription must use an `https` URL
+(typically a push relay that forwards to the browser's push service); the bridge
+POSTs a `PushVerification` to it on create and only delivers once the client
+returns that code through an update. Expiry defaults to 90 days and is capped at
+a year, at most 20 subscriptions per account, and `keys` are accepted but never
+stored or echoed back. Deliveries carry `StateChange` for the subscribed types
+only; `EmailDelivery` fires exclusively for genuine arrivals, so label changes,
+sends, drafts and anything Gmail files into Spam or Trash stay silent. When a
+history record omits labels the bridge asks Gmail rather than guess. Endpoints
+answering 404/410, or failing eight times in a row, are dropped.
 Ordinary newest-first folder pages list by label id, use exact label/profile counts
 and fetch only the required ID pages. Searches, oldest-first ordering, anchors and
 collapsed thread queries enumerate matching IDs before slicing, which can be slow on

@@ -24,7 +24,12 @@ import { GmailPush } from "./push.js";
 
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(
-  app: FastifyInstance<RawServerDefault, RawRequestDefaultExpression, RawReplyDefaultExpression, L>,
+  app: FastifyInstance<
+    RawServerDefault,
+    RawRequestDefaultExpression,
+    RawReplyDefaultExpression,
+    L
+  >,
   cfg: AppConfig,
   google: GmailConfig,
   store: GmailStore,
@@ -39,6 +44,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       google.composeEnabled ?? false,
       google.aliasesEnabled ?? false,
       google.schedule,
+      !!google.push,
     ),
 ): void {
   const accounts = new Map<string, GmailMail>();
@@ -54,14 +60,18 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     // Entries left in `sending` by a crash have an outcome known only through the ledger.
     const recovered = store.scheduleRecover();
     if (recovered)
-      app.log.warn({ recovered }, "gmail scheduled sends interrupted by a previous shutdown were reconciled");
+      app.log.warn(
+        { recovered },
+        "gmail scheduled sends interrupted by a previous shutdown were reconciled",
+      );
     let running = false;
     const tick = async () => {
       if (running) return;
       running = true;
       try {
         for (const email of store.scheduleDueEmails(Date.now())) {
-          if (!google.allowedEmails.has(email) || !store.hasConnection(email)) continue;
+          if (!google.allowedEmails.has(email) || !store.hasConnection(email))
+            continue;
           await account(email)
             .runScheduled()
             .catch((err: unknown) =>
@@ -83,16 +93,27 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
   }
   let push: GmailPush | undefined;
   if (google.push) {
-    push = new GmailPush(store, account, google.allowedEmails, google.push, app.log);
+    push = new GmailPush(
+      store,
+      account,
+      google.allowedEmails,
+      google.push,
+      app.log,
+    );
     hooks.push = push;
     push.start();
     app.addHook("onClose", async () => push?.stop());
   }
   // Without authenticated push the shared secret travels in the query string: never let request logging capture it, configured or not.
   app.post("/gmail/push", { logLevel: "silent" }, async (req, reply) =>
-    push ? push.receive(req, reply) : reply.code(404).send({ error: "not found" }),
+    push
+      ? push.receive(req, reply)
+      : reply.code(404).send({ error: "not found" }),
   );
-  const authenticated = new WeakMap<object, { email: string; mail: GmailMail; uploadType?: string }>();
+  const authenticated = new WeakMap<
+    object,
+    { email: string; mail: GmailMail; uploadType?: string }
+  >();
   app.addHook("onRequest", async (req, reply) => {
     const path = req.url.split("?")[0]!;
     if (path !== "/jmap" && !path.startsWith("/jmap/")) return;
@@ -111,7 +132,11 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     // address, stays with the legacy backend.
     if (!password.startsWith("gmap_")) return;
     const email = store.authenticate(password, username);
-    if (!email || !google.allowedEmails.has(email) || !store.hasConnection(email)) {
+    if (
+      !email ||
+      !google.allowedEmails.has(email) ||
+      !store.hasConnection(email)
+    ) {
       return reply
         .header("WWW-Authenticate", 'Basic realm="gmail-bridge"')
         .code(401)
@@ -121,8 +146,11 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     authenticated.set(req, { email, mail });
     reply.header("Cache-Control", "no-store");
     if (path.startsWith("/jmap/upload/")) {
-      if (!(await mail.canCompose())) return reply.code(403).send({ type: "accountReadOnly" });
-      const type = req.headers["content-type"]?.split(";")[0] ?? "application/octet-stream";
+      if (!(await mail.canCompose()))
+        return reply.code(403).send({ type: "accountReadOnly" });
+      const type =
+        req.headers["content-type"]?.split(";")[0] ??
+        "application/octet-stream";
       authenticated.set(req, { email, mail, uploadType: type });
       // Preserve exact bytes even for text/json uploads: use the existing binary parser.
       req.headers["content-type"] = "application/octet-stream";
@@ -141,7 +169,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
           submissionExtensions: { FUTURERELEASE: ["HOLDFOR", "HOLDUNTIL"] },
         }
       : submissionCapabilityProps();
-    const extraCaps = canCompose ? { [SUBMISSION_CAPABILITY]: submissionProps } : {};
+    const extraCaps = canCompose
+      ? { [SUBMISSION_CAPABILITY]: submissionProps }
+      : {};
     const sessionState = canCompose
       ? google.schedule
         ? "gmail-schedule-v1"
@@ -195,7 +225,11 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     }
     if (req.method === "GET" && path === "/jmap/eventsource") {
       if (!push) return reply.code(404).send({ error: "not found" });
-      const q = req.query as { types?: string; closeafter?: string; ping?: string };
+      const q = req.query as {
+        types?: string;
+        closeafter?: string;
+        ping?: string;
+      };
       const rawTypes = q.types ?? "*";
       const types =
         rawTypes === "*" || rawTypes === ""
@@ -205,13 +239,20 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
               .map((s) => s.trim())
               .filter(Boolean);
       const pingRaw = Number(q.ping ?? 30);
-      const pingSec = Number.isFinite(pingRaw) ? Math.max(15, Math.min(pingRaw, 300)) : 30;
+      const pingSec = Number.isFinite(pingRaw)
+        ? Math.max(15, Math.min(pingRaw, 300))
+        : 30;
       reply.hijack();
-      push.addStream(email, reply, (req.headers.origin as string | undefined) ?? null, {
-        types,
-        closeAfter: q.closeafter === "state",
-        pingSec,
-      });
+      push.addStream(
+        email,
+        reply,
+        (req.headers.origin as string | undefined) ?? null,
+        {
+          types,
+          closeAfter: q.closeafter === "state",
+          pingSec,
+        },
+      );
       return;
     }
     if (req.method === "POST" && path === "/jmap") {
@@ -236,14 +277,25 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       if (
         env.using.some(
           (c) =>
-            c !== CORE_CAPABILITY && c !== MAIL_CAPABILITY && !(canCompose && c === SUBMISSION_CAPABILITY),
+            c !== CORE_CAPABILITY &&
+            c !== MAIL_CAPABILITY &&
+            !(canCompose && c === SUBMISSION_CAPABILITY),
         )
       )
-        return reply.code(400).send({ type: "urn:ietf:params:jmap:error:unknownCapability", status: 400 });
+        return reply
+          .code(400)
+          .send({
+            type: "urn:ietf:params:jmap:error:unknownCapability",
+            status: 400,
+          });
       if (env.methodCalls.length > cfg.limits.maxCallsInRequest)
         return reply
           .code(400)
-          .send({ type: "urn:ietf:params:jmap:error:limit", limit: "maxCallsInRequest", status: 400 });
+          .send({
+            type: "urn:ietf:params:jmap:error:limit",
+            limit: "maxCallsInRequest",
+            status: 400,
+          });
       return reply.send(
         await dispatch(env, {
           methods: mail.methods(),
@@ -255,28 +307,44 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     if (req.method === "POST" && path.startsWith("/jmap/upload/")) {
       if ((req.params as { accountId: string }).accountId !== mail.accountId)
         return reply.code(404).send({ error: "not found" });
-      if (!Buffer.isBuffer(req.body)) return reply.code(400).send({ error: "Invalid upload" });
+      if (!Buffer.isBuffer(req.body))
+        return reply.code(400).send({ error: "Invalid upload" });
       try {
         const type = selected.uploadType ?? "application/octet-stream";
         const blobId = await mail.upload(req.body, type);
-        return reply.send({ accountId: mail.accountId, blobId, type, size: req.body.length });
+        return reply.send({
+          accountId: mail.accountId,
+          blobId,
+          type,
+          size: req.body.length,
+        });
       } catch {
         return reply.code(413).send({ type: "tooLarge" });
       }
     }
     if (req.method === "GET" && path.startsWith("/jmap/download/")) {
-      const p = req.params as { accountId: string; blobId: string; type: string; name: string };
-      if (p.accountId !== mail.accountId) return reply.code(404).send({ error: "not found" });
+      const p = req.params as {
+        accountId: string;
+        blobId: string;
+        type: string;
+        name: string;
+      };
+      if (p.accountId !== mail.accountId)
+        return reply.code(404).send({ error: "not found" });
       try {
         const result = await mail.download(p.blobId);
         const type = /^[\w.+-]+\/[\w.+-]+$/.test(p.type) ? p.type : result.type;
         return reply
           .header("Content-Type", type)
           .header("X-Content-Type-Options", "nosniff")
-          .header("Content-Disposition", `attachment; filename="${encodeURIComponent(p.name)}"`)
+          .header(
+            "Content-Disposition",
+            `attachment; filename="${encodeURIComponent(p.name)}"`,
+          )
           .send(result.body);
       } catch (error) {
-        const status = error instanceof JmapError && error.type === "notFound" ? 404 : 502;
+        const status =
+          error instanceof JmapError && error.type === "notFound" ? 404 : 502;
         return reply.code(status).send({ error: "download unavailable" });
       }
     }
