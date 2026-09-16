@@ -21,7 +21,11 @@ export class GmailApi {
     private connection: GmailConnection,
     private store: GmailStore,
   ) {}
-  async get<T>(resource: string, cost: number, params: Record<string, string> = {}): Promise<T> {
+  async get<T>(
+    resource: string,
+    cost: number,
+    params: Record<string, string | string[]> = {},
+  ): Promise<T> {
     return this.request<T>(resource, cost, params);
   }
   async mutate<T>(
@@ -36,24 +40,31 @@ export class GmailApi {
           resource === "watch" ||
           resource === "stop" ||
           /^messages\/[A-Za-z0-9_-]+\/modify$/.test(resource))) ||
-      ((method === "PATCH" || method === "DELETE") && /^labels\/[A-Za-z0-9_-]+$/.test(resource));
+      ((method === "PATCH" || method === "DELETE") &&
+        /^labels\/[A-Za-z0-9_-]+$/.test(resource));
     const compose =
       this.connection.config?.composeEnabled &&
-      ((method === "POST" && (resource === "drafts" || resource === "drafts/send")) ||
+      ((method === "POST" &&
+        (resource === "drafts" || resource === "drafts/send")) ||
         (method === "DELETE" && /^drafts\/[A-Za-z0-9_-]+$/.test(resource)));
-    if (!allowed && !compose) throw new GmailNotSent("forbidden", "Unsupported Gmail write operation");
+    if (!allowed && !compose)
+      throw new GmailNotSent("forbidden", "Unsupported Gmail write operation");
     return this.request<T>(resource, cost, {}, method, data);
   }
   private async request<T>(
     resource: string,
     cost: number,
-    params: Record<string, string>,
+    params: Record<string, string | string[]>,
     method?: "POST" | "PATCH" | "DELETE",
     body?: unknown,
   ): Promise<T> {
     if (this.waiting.length >= 200)
-      throw new (method ? GmailNotSent : JmapError)("serverUnavailable", "Gmail request queue is full");
-    if (this.active >= 4) await new Promise<void>((resolve) => this.waiting.push(resolve));
+      throw new (method ? GmailNotSent : JmapError)(
+        "serverUnavailable",
+        "Gmail request queue is full",
+      );
+    if (this.active >= 4)
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
     else this.active++;
     // Set right before a write reaches the network: failures before that point never changed Gmail.
     let dispatched = false;
@@ -61,11 +72,13 @@ export class GmailApi {
       const saved = await this.store.load(this.email);
       if (!saved) throw new JmapError("accountNotFound");
       // users.watch/stop only manage push notifications and work with the read-only grant.
-      const pushOnly = method === "POST" && (resource === "watch" || resource === "stop");
+      const pushOnly =
+        method === "POST" && (resource === "watch" || resource === "stop");
       if (
         method &&
         !pushOnly &&
-        (!this.connection.config.writeEnabled || !saved.credentials.scopes?.includes(GMAIL_MODIFY))
+        (!this.connection.config.writeEnabled ||
+          !saved.credentials.scopes?.includes(GMAIL_MODIFY))
       )
         throw new JmapError("accountReadOnly");
       if (
@@ -96,16 +109,28 @@ export class GmailApi {
         },
         this.refreshToken,
       );
-      const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/${resource}`);
-      for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+      const url = new URL(
+        `https://gmail.googleapis.com/gmail/v1/users/me/${resource}`,
+      );
+      // Gmail expects repeated keys for list parameters such as labelIds.
+      for (const [key, value] of Object.entries(params))
+        for (const one of Array.isArray(value) ? value : [value])
+          url.searchParams.append(key, one);
       for (let attempt = 0; ; attempt++) {
         const slot = Math.max(Date.now(), this.nextSlot);
         this.nextSlot = slot + (cost * 1000) / 80; // 4,800 units/min, including retries.
-        if (slot > Date.now()) await new Promise((resolve) => setTimeout(resolve, slot - Date.now()));
+        if (slot > Date.now())
+          await new Promise((resolve) =>
+            setTimeout(resolve, slot - Date.now()),
+          );
         // A sibling request can extend the cooldown while this one is waiting.
         while (this.blockedUntil > Date.now()) {
           const wait = this.blockedUntil - Date.now();
-          if (wait > 10_000) throw new JmapError("serverUnavailable", "Google rate limit; retry later");
+          if (wait > 10_000)
+            throw new JmapError(
+              "serverUnavailable",
+              "Google rate limit; retry later",
+            );
           await new Promise((resolve) => setTimeout(resolve, wait));
         }
         try {
@@ -114,7 +139,9 @@ export class GmailApi {
             url: url.href,
             timeout: 15_000,
             retry: false,
-            ...(method ? { method, ...(body === undefined ? {} : { data: body }) } : {}),
+            ...(method
+              ? { method, ...(body === undefined ? {} : { data: body }) }
+              : {}),
           });
           return data;
         } catch (error) {
@@ -131,29 +158,53 @@ export class GmailApi {
           const reason = response?.data?.error?.errors?.[0]?.reason;
           const rateLimited =
             status === 429 ||
-            (status === 403 && (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded"));
+            (status === 403 &&
+              (reason === "rateLimitExceeded" ||
+                reason === "userRateLimitExceeded"));
           const code =
             (error as { code?: string; cause?: { code?: string } }).code ??
             (error as { cause?: { code?: string } }).cause?.code;
           const networkFailure =
             code !== undefined &&
-            ["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "ECONNREFUSED"].includes(code);
+            [
+              "ECONNRESET",
+              "ETIMEDOUT",
+              "EAI_AGAIN",
+              "ENOTFOUND",
+              "ECONNREFUSED",
+            ].includes(code);
           const temporary =
-            networkFailure || rateLimited || (status !== undefined && [500, 502, 503, 504].includes(status));
+            networkFailure ||
+            rateLimited ||
+            (status !== undefined && [500, 502, 503, 504].includes(status));
           if (method) {
             // A 4xx answer means Google refused the write; timeouts, resets and 5xx leave the outcome unknown.
             if (status === 404) throw new GmailNotSent("notFound");
-            if (status === 400) throw new GmailNotSent("invalidProperties", "Google rejected the update");
+            if (status === 400)
+              throw new GmailNotSent(
+                "invalidProperties",
+                "Google rejected the update",
+              );
             if (status === 409) throw new GmailNotSent("alreadyExists");
-            if (rateLimited) throw new GmailNotSent("serverUnavailable", "Google rate limit; retry later");
+            if (rateLimited)
+              throw new GmailNotSent(
+                "serverUnavailable",
+                "Google rate limit; retry later",
+              );
             if (status === 401)
               throw new GmailNotSent(
                 "serverUnavailable",
                 "Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.",
               );
             if (status !== undefined && status >= 400 && status < 500)
-              throw new GmailNotSent("forbidden", "Google refused the update; verify account permissions");
-            throw new JmapError("serverFail", "Google update failed; refresh before retrying");
+              throw new GmailNotSent(
+                "forbidden",
+                "Google refused the update; verify account permissions",
+              );
+            throw new JmapError(
+              "serverFail",
+              "Google update failed; refresh before retrying",
+            );
           }
           if (!temporary) {
             if (status === 403)
@@ -171,12 +222,17 @@ export class GmailApi {
               ? Number(retryAfter) * 1000
               : Date.parse(retryAfter) - Date.now()
             : 0;
-          const delay = Math.max(1000 * 2 ** attempt, Number.isFinite(requestedDelay) ? requestedDelay : 0);
+          const delay = Math.max(
+            1000 * 2 ** attempt,
+            Number.isFinite(requestedDelay) ? requestedDelay : 0,
+          );
           this.blockedUntil = Math.max(this.blockedUntil, Date.now() + delay);
           if (attempt >= 2 || delay > 10_000)
             throw new JmapError(
               "serverUnavailable",
-              rateLimited ? "Google rate limit; retry later" : "Google temporarily unavailable; retry later",
+              rateLimited
+                ? "Google rate limit; retry later"
+                : "Google temporarily unavailable; retry later",
             );
         }
       }
@@ -198,11 +254,15 @@ function sanitize(error: unknown): JmapError {
   if (error instanceof JmapError) return error;
   const status = (error as { response?: { status?: number } }).response?.status;
   if (status === 404) return new JmapError("notFound");
-  const reason = (error as { response?: { data?: { error?: unknown } } }).response?.data?.error;
+  const reason = (error as { response?: { data?: { error?: unknown } } })
+    .response?.data?.error;
   if (status === 401 || reason === "invalid_grant")
     return new JmapError(
       "serverUnavailable",
       "Google authorization expired or was revoked. Reconnect the Google account; the saved draft is retained.",
     );
-  return new JmapError("serverUnavailable", "Gmail request failed; reconnect if authorization expired");
+  return new JmapError(
+    "serverUnavailable",
+    "Gmail request failed; reconnect if authorization expired",
+  );
 }

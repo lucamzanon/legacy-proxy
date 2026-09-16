@@ -539,10 +539,32 @@ export class GmailMail {
     // Common folder view: use exact label/profile counts and fetch only the
     // requested pages. A large Inbox must not require a full account scan.
     const f = args.filter as Record<string, unknown> | undefined;
+    // "Unread in a folder" is the shape a notification preview and every unread
+    // badge use. Gmail keeps UNREAD as a label, so it lists exactly like a folder
+    // and its count is the label's own messagesUnread - no search, no full scan.
+    const unreadIn = ((): string | undefined => {
+      if (
+        !f ||
+        f.operator !== "AND" ||
+        !Array.isArray(f.conditions) ||
+        f.conditions.length !== 2
+      )
+        return undefined;
+      const parts = f.conditions as Record<string, unknown>[];
+      const box = parts.find(
+        (c) =>
+          c && Object.keys(c).length === 1 && typeof c.inMailbox === "string",
+      );
+      const unread = parts.find(
+        (c) => c && Object.keys(c).length === 1 && c.notKeyword === "$seen",
+      );
+      return box && unread ? (box.inMailbox as string) : undefined;
+    })();
     const simple =
       !f ||
       Object.keys(f).length === 0 ||
-      (Object.keys(f).length === 1 && typeof f.inMailbox === "string");
+      (Object.keys(f).length === 1 && typeof f.inMailbox === "string") ||
+      unreadIn !== undefined;
     const pos = args.position ?? 0;
     if (
       simple &&
@@ -552,18 +574,25 @@ export class GmailMail {
       Number.isSafeInteger(pos) &&
       (pos as number) >= 0
     ) {
+      const box =
+        unreadIn ??
+        (typeof f?.inMailbox === "string" ? f.inMailbox : undefined);
       const label =
-        f?.inMailbox && f.inMailbox !== ALL_MAIL
-          ? labels.find((l) => "l_" + l.id === f.inMailbox)
+        box && box !== ALL_MAIL
+          ? labels.find((l) => "l_" + l.id === box)
           : undefined;
-      const total = label
-        ? label.messagesTotal
-        : (await this.profile()).messagesTotal;
+      const total = unreadIn
+        ? label
+          ? label.messagesUnread
+          : (await this.labels()).find((l) => l.id === "UNREAD")?.messagesTotal
+        : label
+          ? label.messagesTotal
+          : (await this.profile()).messagesTotal;
       if (total !== undefined) {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
         // dependence on search syntax, label names or search-index lag.
-        const listing: Record<string, string> = label
-          ? { labelIds: label.id }
+        const listing: Record<string, string | string[]> = label
+          ? { labelIds: unreadIn ? [label.id, "UNREAD"] : label.id }
           : { q };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);

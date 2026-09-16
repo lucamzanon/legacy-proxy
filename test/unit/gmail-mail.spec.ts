@@ -529,11 +529,9 @@ it("bounds retries and honors long Retry-After without holding a request open", 
     { mech: "XOAUTH2", username: email, refreshToken: "fake" },
     { profile, labels },
   );
-  const request = vi
-    .fn()
-    .mockRejectedValue({
-      response: { status: 429, headers: new Headers({ "retry-after": "60" }) },
-    });
+  const request = vi.fn().mockRejectedValue({
+    response: { status: 429, headers: new Headers({ "retry-after": "60" }) },
+  });
   const client: any = {
     credentials: {},
     setCredentials(c: any) {
@@ -647,4 +645,31 @@ it("finds the inbox by role so push previews work, and rejects unknown mailbox f
   await expect(call({ sortOrder: 1 })).rejects.toMatchObject({
     type: "unsupportedFilter",
   });
+});
+
+it("answers unread-in-folder queries from the label counters instead of scanning", async () => {
+  const f = await setup();
+  const before = f.get.mock.calls.length;
+  const r = (await f.mail.methods()["Email/query"]!({
+    accountId: f.mail.accountId,
+    filter: {
+      operator: "AND",
+      conditions: [{ inMailbox: "l_INBOX" }, { notKeyword: "$seen" }],
+    },
+    sort: [{ property: "receivedAt", isAscending: false }],
+    limit: 1,
+    calculateTotal: true,
+  })) as { ids: string[]; total: number };
+  // The Inbox label's own unread counter, not an enumeration of every message.
+  expect(r.total).toBe(2); // il contatore messagesUnread della Inbox nel fixture
+  expect(r.ids.length).toBeLessThanOrEqual(1);
+  const listed = f.get.mock.calls
+    .slice(before)
+    .filter((c) => c[0] === "messages");
+  expect(listed.length).toBeGreaterThan(0);
+  // Listed by label membership (INBOX + UNREAD), never by a search query.
+  for (const call of listed) {
+    expect(call[2].labelIds).toEqual(["INBOX", "UNREAD"]);
+    expect(call[2].q).toBeUndefined();
+  }
 });
