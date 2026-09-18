@@ -86,9 +86,17 @@ async function setup() {
     }
     if (resource === "messages/import") {
       const n = ++next;
-      const m = { id: "imsg" + n, threadId: "ithread" + n, labelIds: [...data.labelIds], internalDate: "2000", raw: data.raw };
+      const m = {
+        id: "imsg" + n,
+        threadId: "ithread" + n,
+        labelIds: [...data.labelIds],
+        internalDate: "2000",
+        sizeEstimate: 800,
+        raw: data.raw,
+      };
       messages.set(m.id, m);
-      return structuredClone(m);
+      // Live Gmail answers messages.import with the id alone.
+      return { id: m.id };
     }
     if (resource.startsWith("drafts/") && method === "DELETE") {
       const d = drafts.get(resource.slice(7));
@@ -469,7 +477,7 @@ it("attaches replies to the original Gmail thread after verifying Message-ID and
 });
 
 it("imports foreign mail into a writable mailbox through messages.import, mapping keywords to labels", async () => {
-  const { mail, request, mutate, messages } = await setup();
+  const { mail, request, mutate, messages, get } = await setup();
   const raw = Buffer.from(
     "From: someone-else@example.test\r\nTo: writer@example.test\r\nDate: Mon, 01 Sep 2026 10:00:00 +0000\r\nSubject: Moved\r\n\r\nBody\r\n",
   );
@@ -495,7 +503,7 @@ it("imports foreign mail into a writable mailbox through messages.import, mappin
   expect(created).toMatchObject({
     id: "m_imsg1",
     threadId: "t_ithread1",
-    size: raw.length,
+    size: 800,
     mailboxIds: { all: true, l_INBOX: true },
     keywords: { $flagged: true },
   });
@@ -504,6 +512,7 @@ it("imports foreign mail into a writable mailbox through messages.import, mappin
   expect(call[3]).toEqual({ raw: raw.toString("base64url"), labelIds: ["INBOX", "UNREAD", "STARRED"] });
   expect(call[4]).toEqual({ internalDateSource: "dateHeader", neverMarkSpam: "true" });
   expect(messages.get("imsg1").labelIds).toEqual(["INBOX", "UNREAD", "STARRED"]);
+  expect(get.mock.calls.some((c) => c[0] === "messages/imsg1" && c[2]?.format === "minimal")).toBe(true);
   expect(mutate.mock.calls.some((c) => c[0] === "drafts")).toBe(false);
 });
 it("imports seen mail into All mail alone as an archived message with no labels", async () => {

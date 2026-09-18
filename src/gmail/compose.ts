@@ -189,13 +189,20 @@ export class GmailCompose {
   }
   /** File received mail through users.messages.import: no From check, ordering from the Date header. */
   private async importRaw(raw: Buffer, labelIds: string[]): Promise<Record<string, unknown>> {
-    const message = await this.mutate<GmailMessage>(
+    const imported = await this.mutate<Partial<GmailMessage> & { id: string }>(
       "messages/import",
       25,
       "POST",
       { raw: raw.toString("base64url"), labelIds },
       { internalDateSource: "dateHeader", neverMarkSpam: "true" },
     );
+    // Gmail answers messages.import with the id alone: read the stored message for its thread and labels.
+    const message =
+      imported.threadId && imported.labelIds
+        ? (imported as GmailMessage)
+        : await this.c.api.get<GmailMessage>("messages/" + encodeURIComponent(imported.id), 5, {
+            format: "minimal",
+          });
     const labels = message.labelIds ?? labelIds;
     const keywords: Record<string, true> = {};
     if (!labels.includes("UNREAD")) keywords.$seen = true;
@@ -204,7 +211,7 @@ export class GmailCompose {
     return {
       id: "m_" + message.id,
       threadId: "t_" + message.threadId,
-      size: raw.length,
+      size: message.sizeEstimate ?? raw.length,
       mailboxIds: Object.fromEntries(
         [ALL_MAIL, ...labels.filter((id) => !HIDDEN_LABELS.has(id)).map((id) => "l_" + id)].map((id) => [id, true]),
       ),
