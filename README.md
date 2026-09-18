@@ -439,7 +439,14 @@ structures, inline parts and uploaded or existing message attachments. New mail
 must target Drafts. Draft saves use native Gmail drafts; Bulwark replaces an edited
 draft by creating the replacement before discarding the old copy. Email/set destroy
 can discard a draft, but cannot permanently delete received/sent mail. Email/import
-accepts MIME into Drafts only; importing archives is not implemented.
+into Drafts creates a native Gmail draft (From must be one of the account's
+identities). Email/import into any other writable mailbox (Inbox, Spam, Trash,
+user labels, or All mail alone to archive) files the MIME through
+`users.messages.import` with `GMAIL_WRITE_ENABLED` alone: any From is accepted,
+`$seen`, `$flagged` and `$important` map to Gmail's labels, other keywords are
+dropped, Gmail orders the message by its Date header (`receivedAt` is ignored)
+and the message is never marked as spam. Sent and Drafts cannot be import
+targets except through the draft path.
 
 Uploads preserve exact bytes (including JSON attachments), are scoped to the
 account, expire after 24 hours and are capped at 25 MB each / 100 MB total per

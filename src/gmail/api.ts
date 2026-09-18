@@ -33,12 +33,14 @@ export class GmailApi {
     cost: number,
     method: "POST" | "PATCH" | "DELETE",
     data?: unknown,
+    params: Record<string, string | string[]> = {},
   ): Promise<T> {
     const allowed =
       (method === "POST" &&
         (resource === "labels" ||
           resource === "watch" ||
           resource === "stop" ||
+          resource === "messages/import" ||
           /^messages\/[A-Za-z0-9_-]+\/modify$/.test(resource))) ||
       ((method === "PATCH" || method === "DELETE") &&
         /^labels\/[A-Za-z0-9_-]+$/.test(resource));
@@ -49,7 +51,7 @@ export class GmailApi {
         (method === "DELETE" && /^drafts\/[A-Za-z0-9_-]+$/.test(resource)));
     if (!allowed && !compose)
       throw new GmailNotSent("forbidden", "Unsupported Gmail write operation");
-    return this.request<T>(resource, cost, {}, method, data);
+    return this.request<T>(resource, cost, params, method, data);
   }
   private async request<T>(
     resource: string,

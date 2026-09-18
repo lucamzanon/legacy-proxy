@@ -106,6 +106,7 @@ export class GmailMail {
       enabled: () => this.canCompose(),
       state: () => this.state(),
       download: (id) => this.download(id),
+      labels: () => this.labels(),
       exclusive: (work) => this.exclusive(work),
       ...(aliasesEnabled
         ? { sendAs: (fresh: boolean) => this.sendAs(fresh) }

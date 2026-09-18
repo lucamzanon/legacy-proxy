@@ -5,7 +5,9 @@ import { JmapError } from "../jmap/errors.js";
 import { SIDE_RESPONSES, type MethodTable } from "../jmap/router.js";
 import { GmailNotSent, type GmailApi } from "./api.js";
 import { GmailStore, type ScheduleRow } from "./store.js";
-import { upstreamId, type GmailMessage } from "./message.js";
+import { ALL_MAIL, HIDDEN_LABELS, upstreamId, type GmailMessage } from "./message.js";
+import { writableLabel } from "./write.js";
+import type { GmailLabel } from "./store.js";
 
 const MAX_RAW = 25_000_000;
 const fail = (type: string, description: string): never => {
@@ -52,6 +54,8 @@ interface ComposeContext {
   enabled: () => Promise<boolean>;
   state: () => Promise<string>;
   download: (id: string) => Promise<{ body: Buffer; type: string }>;
+  /** Current Gmail labels, for Email/import into places other than Drafts. */
+  labels: () => Promise<GmailLabel[]>;
   exclusive: <T>(work: () => Promise<T>) => Promise<T>;
   /** Absent when GMAIL_ALIASES_ENABLED is off: only the account address may send. */
   sendAs?: (fresh: boolean) => Promise<SendAs[]>;
@@ -129,10 +133,11 @@ export class GmailCompose {
     cost: number,
     method: "POST" | "DELETE",
     data?: unknown,
+    params?: Record<string, string>,
   ): Promise<T> {
     this.c.store.invalidate(this.c.email);
     try {
-      return await this.c.api.mutate<T>(resource, cost, method, data);
+      return await this.c.api.mutate<T>(resource, cost, method, data, params);
     } finally {
       this.c.store.invalidate(this.c.email);
     }
@@ -150,6 +155,61 @@ export class GmailCompose {
       Object.entries(keywords).some(([k, v]) => v !== true || !["$draft", "$seen"].includes(k))
     )
       fail("invalidProperties", "Unsupported draft keywords");
+  }
+  /** Gmail labels for an Email/import that files mail somewhere other than Drafts.
+   * Returns null when the input describes a draft, which keeps the drafts path. */
+  private async importLabels(input: Record<string, unknown>): Promise<string[] | null> {
+    const boxes = obj(input.mailboxIds ?? { l_DRAFT: true });
+    if (boxes.l_DRAFT) {
+      this.placement(input);
+      return null;
+    }
+    const entries = Object.entries(boxes);
+    if (!entries.length) fail("invalidProperties", "Message must belong to at least one mailbox");
+    const labels = await this.c.labels();
+    const ids = new Set<string>();
+    for (const [id, value] of entries) {
+      if (value !== true) fail("invalidProperties", "Mailbox membership must be true");
+      if (id === ALL_MAIL) continue;
+      const label = labels.find((l) => "l_" + l.id === id);
+      if (!label) fail("invalidProperties", "Unknown mailbox");
+      if (!writableLabel(label!)) fail("invalidProperties", "Mailbox is read-only");
+      ids.add(label!.id);
+    }
+    const keywords = obj(input.keywords ?? {});
+    for (const [key, value] of Object.entries(keywords)) {
+      if (value !== true) fail("invalidProperties", "Keyword value must be true");
+      if (key === "$draft") fail("invalidProperties", "Drafts can only be imported into the Drafts mailbox");
+    }
+    // Gmail has no place for other keywords ($answered, $forwarded, custom): they are dropped, not refused.
+    if (!keywords.$seen) ids.add("UNREAD");
+    if (keywords.$flagged) ids.add("STARRED");
+    if (keywords.$important) ids.add("IMPORTANT");
+    return [...ids];
+  }
+  /** File received mail through users.messages.import: no From check, ordering from the Date header. */
+  private async importRaw(raw: Buffer, labelIds: string[]): Promise<Record<string, unknown>> {
+    const message = await this.mutate<GmailMessage>(
+      "messages/import",
+      25,
+      "POST",
+      { raw: raw.toString("base64url"), labelIds },
+      { internalDateSource: "dateHeader", neverMarkSpam: "true" },
+    );
+    const labels = message.labelIds ?? labelIds;
+    const keywords: Record<string, true> = {};
+    if (!labels.includes("UNREAD")) keywords.$seen = true;
+    if (labels.includes("STARRED")) keywords.$flagged = true;
+    if (labels.includes("IMPORTANT")) keywords.$important = true;
+    return {
+      id: "m_" + message.id,
+      threadId: "t_" + message.threadId,
+      size: raw.length,
+      mailboxIds: Object.fromEntries(
+        [ALL_MAIL, ...labels.filter((id) => !HIDDEN_LABELS.has(id)).map((id) => "l_" + id)].map((id) => [id, true]),
+      ),
+      keywords,
+    };
   }
   private async rawFromCreate(input: Record<string, unknown>): Promise<Buffer> {
     const permitted = new Set([
@@ -736,8 +796,8 @@ export class GmailCompose {
       ];
     return result;
   }
-  private async importDrafts(a: Record<string, unknown>): Promise<unknown> {
-    await this.check(a);
+  private async importEmails(a: Record<string, unknown>): Promise<unknown> {
+    if (a.accountId !== this.c.accountId) fail("accountNotFound", "Wrong account");
     const emails = obj(a.emails);
     if (Object.keys(emails).length > 20) fail("requestTooLarge", "Too many imports");
     const oldState = await this.c.state();
@@ -747,13 +807,19 @@ export class GmailCompose {
     for (const [key, value] of Object.entries(emails))
       try {
         const p = obj(value);
-        this.placement(p);
         for (const k of Object.keys(p))
           if (!["blobId", "mailboxIds", "keywords", "receivedAt"].includes(k))
             fail("invalidProperties", "Unsupported import property");
+        // receivedAt is accepted for compatibility; Gmail orders imported mail by its Date header.
+        const labelIds = await this.importLabels(p);
         if (typeof p.blobId !== "string") fail("blobNotFound", "Missing MIME blob");
         const data = await this.c.download(p.blobId as string);
         if (!data.body.length || data.body.length > MAX_RAW) fail("tooLarge", "MIME import exceeds limit");
+        if (labelIds) {
+          created[key] = await this.importRaw(data.body, labelIds);
+          continue;
+        }
+        if (!(await this.c.enabled())) fail("accountReadOnly", "Composition disabled");
         await this.recipients(data.body, await this.senders());
         created[key] = await this.createRaw(data.body);
       } catch (e) {
@@ -769,7 +835,7 @@ export class GmailCompose {
   }
   methods(): MethodTable {
     return {
-      "Email/import": (a) => this.c.exclusive(() => this.importDrafts(a)),
+      "Email/import": (a) => this.c.exclusive(() => this.importEmails(a)),
       "Identity/get": async (a) => {
         await this.check(a);
         // Settings outages degrade to the primary address so composing keeps working; sending re-validates anyway.

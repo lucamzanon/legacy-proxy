@@ -84,6 +84,12 @@ async function setup() {
       drafts.delete(d.id);
       return structuredClone(m);
     }
+    if (resource === "messages/import") {
+      const n = ++next;
+      const m = { id: "imsg" + n, threadId: "ithread" + n, labelIds: [...data.labelIds], internalDate: "2000", raw: data.raw };
+      messages.set(m.id, m);
+      return structuredClone(m);
+    }
     if (resource.startsWith("drafts/") && method === "DELETE") {
       const d = drafts.get(resource.slice(7));
       if (!d) throw new JmapError("notFound");
@@ -460,4 +466,84 @@ it("attaches replies to the original Gmail thread after verifying Message-ID and
   mutate.mockClear();
   await save({ subject: "Changed subject", inReplyTo: ["parent@example.test"] });
   expect(mutate.mock.calls.find((c) => c[0] === "drafts")?.[3].message.threadId).toBeUndefined();
+});
+
+it("imports foreign mail into a writable mailbox through messages.import, mapping keywords to labels", async () => {
+  const { mail, request, mutate, messages } = await setup();
+  const raw = Buffer.from(
+    "From: someone-else@example.test\r\nTo: writer@example.test\r\nDate: Mon, 01 Sep 2026 10:00:00 +0000\r\nSubject: Moved\r\n\r\nBody\r\n",
+  );
+  const blob = await mail.upload(raw, "message/rfc822");
+  const r = await request([
+    [
+      "Email/import",
+      {
+        accountId: mail.accountId,
+        emails: {
+          m: {
+            blobId: blob,
+            mailboxIds: { l_INBOX: true },
+            keywords: { $flagged: true, $answered: true },
+            receivedAt: "2026-09-01T10:00:00Z",
+          },
+        },
+      },
+      "0",
+    ],
+  ]);
+  const created = (r.methodResponses[0]![1].created as any).m;
+  expect(created).toMatchObject({
+    id: "m_imsg1",
+    threadId: "t_ithread1",
+    size: raw.length,
+    mailboxIds: { all: true, l_INBOX: true },
+    keywords: { $flagged: true },
+  });
+  const call = mutate.mock.calls.find((c) => c[0] === "messages/import")!;
+  expect(call[2]).toBe("POST");
+  expect(call[3]).toEqual({ raw: raw.toString("base64url"), labelIds: ["INBOX", "UNREAD", "STARRED"] });
+  expect(call[4]).toEqual({ internalDateSource: "dateHeader", neverMarkSpam: "true" });
+  expect(messages.get("imsg1").labelIds).toEqual(["INBOX", "UNREAD", "STARRED"]);
+  expect(mutate.mock.calls.some((c) => c[0] === "drafts")).toBe(false);
+});
+it("imports seen mail into All mail alone as an archived message with no labels", async () => {
+  const { mail, request, mutate } = await setup();
+  const raw = Buffer.from("From: a@example.test\r\nTo: writer@example.test\r\nSubject: Old\r\n\r\nBody\r\n");
+  const blob = await mail.upload(raw, "message/rfc822");
+  const r = await request([
+    [
+      "Email/import",
+      { accountId: mail.accountId, emails: { m: { blobId: blob, mailboxIds: { all: true }, keywords: { $seen: true } } } },
+      "0",
+    ],
+  ]);
+  expect((r.methodResponses[0]![1].created as any).m.keywords).toEqual({ $seen: true });
+  expect(mutate.mock.calls.find((c) => c[0] === "messages/import")![3].labelIds).toEqual([]);
+});
+it("refuses imports into read-only mailboxes, unknown mailboxes and drafts outside the Drafts mailbox", async () => {
+  const { mail, request, mutate } = await setup();
+  const raw = Buffer.from("From: a@example.test\r\nTo: writer@example.test\r\nSubject: X\r\n\r\nBody\r\n");
+  const blob = await mail.upload(raw, "message/rfc822");
+  const r = await request([
+    [
+      "Email/import",
+      {
+        accountId: mail.accountId,
+        emails: {
+          sent: { blobId: blob, mailboxIds: { l_SENT: true } },
+          unknown: { blobId: blob, mailboxIds: { l_NOPE: true } },
+          draft: { blobId: blob, mailboxIds: { l_INBOX: true }, keywords: { $draft: true } },
+          mixed: { blobId: blob, mailboxIds: { l_DRAFT: true, l_INBOX: true }, keywords: { $draft: true } },
+        },
+      },
+      "0",
+    ],
+  ]);
+  const notCreated = r.methodResponses[0]![1].notCreated as any;
+  expect(r.methodResponses[0]![1].created).toBeNull();
+  expect(notCreated.sent.description).toBe("Mailbox is read-only");
+  expect(notCreated.unknown.description).toBe("Unknown mailbox");
+  expect(notCreated.draft.description).toMatch(/Drafts mailbox/);
+  expect(notCreated.mixed.description).toBe("New mail must be a draft");
+  expect(mutate.mock.calls.some((c) => c[0] === "messages/import")).toBe(false);
 });
