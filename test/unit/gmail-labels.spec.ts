@@ -51,3 +51,48 @@ it("lists places mail is filed, not read, star or importance states", async () =
   expect(mapped.mailboxIds).toEqual({ all: true, l_INBOX: true });
   expect(mapped.keywords).toEqual({ $flagged: true, $important: true });
 });
+
+it("returns the whole folder list for an account with more labels than maxObjectsInGet", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-labels-"));
+  const store = new GmailStore(dir, crypto.randomBytes(32));
+  cleanup.push(() => {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  // A real Workspace mailbox with 124 labels used to answer `requestTooLarge`
+  // to Bulwark's `Mailbox/get` with no ids, leaving the client with no folders
+  // at all - an empty inbox that retried forever.
+  const many = [
+    { id: "INBOX", name: "INBOX", type: "system", messagesTotal: 1, messagesUnread: 1 },
+    ...Array.from({ length: 130 }, (_, i) => ({
+      id: `Label_${i}`,
+      name: `Folder ${i}`,
+      type: "user",
+    })),
+  ];
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile")
+      return { emailAddress: email, historyId: "5", messagesTotal: 1, threadsTotal: 1 };
+    if (resource === "labels") return { labels: many };
+    if (resource.startsWith("labels/"))
+      return many.find((l) => l.id === decodeURIComponent(resource.slice(7)));
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as any, store);
+  const methods = mail.methods();
+
+  const all = (await methods["Mailbox/get"]!({ accountId: mail.accountId })) as any;
+  expect(all.list).toHaveLength(132); // 130 user labels + Inbox + the synthetic "all"
+  expect(all.list.some((m: any) => m.id === "l_INBOX")).toBe(true);
+
+  const queried = (await methods["Mailbox/query"]!({ accountId: mail.accountId })) as any;
+  expect(queried.ids).toHaveLength(132);
+
+  // A caller naming its own ids is still bounded by maxObjectsInGet.
+  await expect(
+    methods["Email/get"]!({
+      accountId: mail.accountId,
+      ids: Array.from({ length: 101 }, (_, i) => `m_${i}`),
+    }),
+  ).rejects.toMatchObject({ type: "requestTooLarge" });
+});

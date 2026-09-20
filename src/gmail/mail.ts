@@ -48,6 +48,15 @@ const ROLES: Record<string, string> = {
   TRASH: "trash",
 };
 const MAX_GET = 100;
+/**
+ * Mailboxes are the whole label set of the account, already materialised in
+ * memory, and a client that asks for every folder (`ids: null`, which is what
+ * Bulwark sends) has to get every folder. `maxObjectsInGet` bounds how many
+ * ids a *caller* may name, not how big the folder list may be - capping the
+ * full list at 100 left accounts with more labels (a Workspace mailbox with
+ * 124) with no folders at all. Gmail's own ceiling is 10k labels.
+ */
+const MAX_MAILBOX_GET = 10_000;
 const MAX_QUERY = 100;
 const MAX_BLOB = 50_000_000;
 /** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
@@ -331,14 +340,17 @@ export class GmailMail {
   private account(args: Record<string, unknown>): void {
     if (args.accountId !== this.accountId) throw accountNotFound();
   }
-  private ids(args: Record<string, unknown>): string[] | null {
+  private ids(
+    args: Record<string, unknown>,
+    max: number = MAX_GET,
+  ): string[] | null {
     if (args.ids == null) return null;
     if (
       !Array.isArray(args.ids) ||
       args.ids.some((id) => typeof id !== "string")
     )
       throw invalidArguments("ids must be an array of strings or null");
-    if (args.ids.length > MAX_GET) throw new JmapError("requestTooLarge");
+    if (args.ids.length > max) throw new JmapError("requestTooLarge");
     return args.ids as string[];
   }
   private properties(args: Record<string, unknown>): string[] | null {
@@ -1030,13 +1042,14 @@ export class GmailMail {
       "Core/echo": async (a) => a,
       "Mailbox/get": async (a) => {
         this.account(a);
-        const ids = this.ids(a);
+        const ids = this.ids(a, MAX_MAILBOX_GET);
         const properties = this.properties(a);
         const records = await this.mailboxes();
         const selected = ids
           ? records.filter((r) => ids.includes(r.id as string))
           : records;
-        if (selected.length > MAX_GET) throw new JmapError("requestTooLarge");
+        if (selected.length > MAX_MAILBOX_GET)
+          throw new JmapError("requestTooLarge");
         return {
           accountId: this.accountId,
           state: await this.mailboxState(),
@@ -1055,7 +1068,9 @@ export class GmailMail {
           );
         const records = mailboxFilter(await this.mailboxes(), a.filter);
         const position = a.position ?? 0;
-        const limit = a.limit ?? MAX_GET;
+        // No caller limit means "every mailbox that matches"; a default of 100
+        // silently hid the tail of a large label set from paginating clients.
+        const limit = a.limit ?? MAX_MAILBOX_GET;
         if (
           !Number.isSafeInteger(position) ||
           !Number.isSafeInteger(limit) ||
@@ -1071,7 +1086,7 @@ export class GmailMail {
           ids: records
             .slice(
               position as number,
-              (position as number) + Math.min(limit as number, MAX_QUERY),
+              (position as number) + Math.min(limit as number, MAX_MAILBOX_GET),
             )
             .map((r) => r.id),
           ...(a.calculateTotal ? { total: records.length } : {}),
