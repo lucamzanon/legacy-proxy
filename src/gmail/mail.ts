@@ -314,17 +314,54 @@ export class GmailMail {
     );
     return state;
   }
+  /**
+   * The label set without counters: one Gmail call, whatever the account size.
+   * Enough to know which labels exist, what they are called and which role
+   * they carry - everything but `messages*`/`threads*`, which only
+   * `labels.get` reports.
+   */
+  async labelList(): Promise<GmailLabel[]> {
+    const state = await this.state();
+    const data = await this.cached<{ labels?: GmailLabel[] }>(
+      "labellist:" + state,
+      60_000,
+      () => this.api.get<{ labels?: GmailLabel[] }>("labels", 1),
+    );
+    return data.labels ?? [];
+  }
+  /**
+   * Counters for one label. A folder page and an unread badge each need a
+   * single label's numbers; reaching them through {@link labels} costs one
+   * Gmail call per label in the account (124 of them on a real Workspace
+   * mailbox, ~7.5 s), which is what used to time out a push preview.
+   */
+  async labelDetail(id: string): Promise<GmailLabel | undefined> {
+    const state = await this.state();
+    try {
+      return await this.cached<GmailLabel>(
+        `label:${id}:${state}`,
+        60_000,
+        () => this.api.get<GmailLabel>(`labels/${encodeURIComponent(id)}`, 1),
+      );
+    } catch (error) {
+      if (error instanceof JmapError && error.type === "notFound")
+        return undefined;
+      throw error;
+    }
+  }
+  /** Every label with its counters: one Gmail call per label, so keep it off
+   * the paths that only need one label or no counter at all. */
   async labels(): Promise<GmailLabel[]> {
     const state = await this.state();
     return this.cached("labels:" + state, 60_000, async () => {
-      const data = await this.api.get<{ labels?: GmailLabel[] }>("labels", 1);
+      const listed = await this.labelList();
       // API gateway caps concurrency; label detail supplies exact message/thread counts.
       const labels: GmailLabel[] = [];
-      for (let offset = 0; offset < (data.labels ?? []).length; offset += 4) {
+      for (let offset = 0; offset < listed.length; offset += 4) {
         labels.push(
           ...(await Promise.all(
-            data
-              .labels!.slice(offset, offset + 4)
+            listed
+              .slice(offset, offset + 4)
               .map((label) =>
                 this.api.get<GmailLabel>(
                   `labels/${encodeURIComponent(label.id)}`,
@@ -375,9 +412,18 @@ export class GmailMail {
     }
     return result;
   }
-  async mailboxes(): Promise<Record<string, unknown>[]> {
+  /**
+   * The account's folders. `counts: false` builds them from the cheap label
+   * listing, leaving every `*Emails`/`*Threads` figure at zero: that is all a
+   * `Mailbox/query` needs (it answers with ids), and it spares an account with
+   * many labels one Gmail call per label.
+   */
+  async mailboxes(
+    opts: { counts?: boolean } = {},
+  ): Promise<Record<string, unknown>[]> {
+    const counts = opts.counts !== false;
     const [labels, profile, writable] = await Promise.all([
-      this.labels(),
+      counts ? this.labels() : this.labelList(),
       this.profile(),
       this.writable(),
     ]);
@@ -523,8 +569,13 @@ export class GmailMail {
     args: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     this.account(args);
-    const labels = await this.labels();
-    const q = gmailFilter(args.filter, labels);
+    // Translating an arbitrary filter into a Gmail search needs every label's
+    // name. The folder and unread paths below need one label's counters or
+    // none at all, so the full listing - one Gmail call per label - is built
+    // only if something really asks for it.
+    let search: string | undefined;
+    const q = async () =>
+      (search ??= gmailFilter(args.filter, await this.labels()));
     const sort = args.sort ?? [{ property: "receivedAt", isAscending: false }];
     if (
       !Array.isArray(sort) ||
@@ -590,14 +641,18 @@ export class GmailMail {
       const box =
         unreadIn ??
         (typeof f?.inMailbox === "string" ? f.inMailbox : undefined);
-      const label =
-        box && box !== ALL_MAIL
-          ? labels.find((l) => "l_" + l.id === box)
+      // A mailbox id carries the Gmail label id, so one `labels.get` answers
+      // "how many (unread) messages are in this folder" without listing the
+      // account's other labels.
+      const labelId =
+        box && box !== ALL_MAIL && /^l_[A-Za-z0-9_-]+$/.test(box)
+          ? box.slice(2)
           : undefined;
+      const label = labelId ? await this.labelDetail(labelId) : undefined;
       const total = unreadIn
         ? label
           ? label.messagesUnread
-          : (await this.labels()).find((l) => l.id === "UNREAD")?.messagesTotal
+          : (await this.labelDetail("UNREAD"))?.messagesTotal
         : label
           ? label.messagesTotal
           : (await this.profile()).messagesTotal;
@@ -606,7 +661,7 @@ export class GmailMail {
         // dependence on search syntax, label names or search-index lag.
         const listing: Record<string, string | string[]> = label
           ? { labelIds: unreadIn ? [label.id, "UNREAD"] : label.id }
-          : { q };
+          : { q: await q() };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
         const refs = new Map<string, { id: string; threadId: string }>();
@@ -646,7 +701,13 @@ export class GmailMail {
           } while (token && refs.size < wanted);
         return {
           accountId: this.accountId,
-          queryState: hash([state, q]),
+          // The filter identity, without paying for the search translation on
+          // the label path: a folder page and an unread page of the same
+          // folder are different queries.
+          queryState: hash([
+            state,
+            label ? ["label", label.id, unreadIn ? "unread" : "all"] : search,
+          ]),
           canCalculateChanges: false,
           position: pos,
           ids: [...refs.values()]
@@ -659,8 +720,9 @@ export class GmailMail {
     }
     // Enumerate IDs only: exact totals and reverse/anchor pagination without
     // fetching metadata for the entire mailbox. Never expose resultSizeEstimate as total.
+    const gmailQuery = await q();
     const references = await this.cached<{ id: string; threadId: string }[]>(
-      `query:${state}:${hash(q)}`,
+      `query:${state}:${hash(gmailQuery)}`,
       30 * 60_000,
       async () => {
         const result = new Map<string, { id: string; threadId: string }>();
@@ -671,7 +733,7 @@ export class GmailMail {
             messages?: { id: string; threadId: string }[];
             nextPageToken?: string;
           }>("messages", 5, {
-            q,
+            q: gmailQuery,
             includeSpamTrash: "true",
             maxResults: "500",
             ...(pageToken ? { pageToken } : {}),
@@ -1066,7 +1128,12 @@ export class GmailMail {
             "unsupportedSort",
             "Mailbox query sorting is not supported yet",
           );
-        const records = mailboxFilter(await this.mailboxes(), a.filter);
+        // Filtering and the id list read names, roles and visibility - never a
+        // counter - so this takes the listing that costs one Gmail call.
+        const records = mailboxFilter(
+          await this.mailboxes({ counts: false }),
+          a.filter,
+        );
         const position = a.position ?? 0;
         // No caller limit means "every mailbox that matches"; a default of 100
         // silently hid the tail of a large label set from paginating clients.
@@ -1080,7 +1147,9 @@ export class GmailMail {
           throw invalidArguments("Invalid mailbox pagination");
         return {
           accountId: this.accountId,
-          queryState: await this.mailboxState(),
+          // A query state tracks the result - the set of matching mailboxes -
+          // not their contents, so it is the ids that have to hash here.
+          queryState: hash(records.map((r) => r.id)),
           canCalculateChanges: false,
           position,
           ids: records

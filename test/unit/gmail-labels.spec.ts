@@ -96,3 +96,58 @@ it("returns the whole folder list for an account with more labels than maxObject
     }),
   ).rejects.toMatchObject({ type: "requestTooLarge" });
 });
+
+it("answers a push preview's mailbox query without reading every label's counters", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-labels-"));
+  const store = new GmailStore(dir, crypto.randomBytes(32));
+  cleanup.push(() => {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const many = [
+    { id: "INBOX", name: "INBOX", type: "system", messagesTotal: 3, messagesUnread: 2 },
+    ...Array.from({ length: 130 }, (_, i) => ({
+      id: `Label_${i}`,
+      name: `Folder ${i}`,
+      type: "user",
+    })),
+  ];
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile")
+      return { emailAddress: email, historyId: "5", messagesTotal: 3, threadsTotal: 3 };
+    if (resource === "labels") return { labels: many };
+    if (resource.startsWith("labels/"))
+      return many.find((l) => l.id === decodeURIComponent(resource.slice(7)));
+    if (resource === "messages") return { messages: [{ id: "x", threadId: "t" }] };
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as any, store);
+  const methods = mail.methods();
+
+  // "Which mailbox is the inbox" - the first half of /api/push/preview.
+  const query = (await methods["Mailbox/query"]!({
+    accountId: mail.accountId,
+    filter: { role: "inbox" },
+    limit: 1,
+  })) as any;
+  expect(query.ids).toEqual(["l_INBOX"]);
+
+  // The second half: newest unread in that mailbox, with its total.
+  const unread = (await methods["Email/query"]!({
+    accountId: mail.accountId,
+    filter: {
+      operator: "AND",
+      conditions: [{ inMailbox: "l_INBOX" }, { notKeyword: "$seen" }],
+    },
+    sort: [{ property: "receivedAt", isAscending: false }],
+    limit: 1,
+    calculateTotal: true,
+  })) as any;
+  expect(unread).toMatchObject({ ids: ["m_x"], total: 2 });
+
+  // One label detail (INBOX), not 131 of them: on a real Workspace account
+  // that difference was ~7.5 s per preview, and the notification arrived
+  // generic because the service worker had given up waiting.
+  const details = get.mock.calls.filter((c) => String(c[0]).startsWith("labels/"));
+  expect(details.map((c) => c[0])).toEqual(["labels/INBOX"]);
+});

@@ -389,18 +389,17 @@ it("opens a large folder without scanning every page", async () => {
 
 it("lists a folder page by label id instead of a label-name search", async () => {
   const { mail, store, get } = setup();
+  // Only this one label's counters are seeded: a folder page must not need
+  // the whole label set (one Gmail call per label) to answer.
   store.cache(
     email,
-    "labels:g123",
-    [
-      ...labels,
-      {
-        id: "Label_1",
-        name: "Work / Q&A (2026)",
-        type: "user",
-        messagesTotal: 2,
-      },
-    ],
+    "label:Label_1:g123",
+    {
+      id: "Label_1",
+      name: "Work / Q&A (2026)",
+      type: "user",
+      messagesTotal: 2,
+    },
     60_000,
   );
   const result = await mail.methods()["Email/query"]!({
@@ -416,6 +415,7 @@ it("lists a folder page by label id instead of a label-name search", async () =>
     includeSpamTrash: "true",
   });
   expect(listing[2]).not.toHaveProperty("q");
+  expect(get.mock.calls.some((c) => c[0] === "labels")).toBe(false);
 });
 it("treats unmapped client keywords as absent", () => {
   expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe(
