@@ -8,6 +8,7 @@ import type {
 import type { AppConfig } from "../util/config.js";
 import {
   CORE_CAPABILITY,
+  KEYWORDS_CAPABILITY,
   MAIL_CAPABILITY,
   SUBMISSION_CAPABILITY,
   submissionCapabilityProps,
@@ -198,6 +199,11 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
             maxSizeUpload: 25_000_000,
           },
           [MAIL_CAPABILITY]: {},
+          // Gmail knows every label's counts, so keyword enumeration is a
+          // listing rather than a walk through the mailbox.
+          ...(google.labelTags ?? true
+            ? { [KEYWORDS_CAPABILITY]: { supportsCounts: true } }
+            : {}),
           ...extraCaps,
         },
         accounts: {
@@ -205,7 +211,11 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
             name: email,
             isPersonal: true,
             isReadOnly: !writable,
-            accountCapabilities: { [MAIL_CAPABILITY]: mailProps, ...extraCaps },
+            accountCapabilities: {
+              [MAIL_CAPABILITY]: mailProps,
+              ...(google.labelTags ?? true ? { [KEYWORDS_CAPABILITY]: {} } : {}),
+              ...extraCaps,
+            },
           },
         },
         primaryAccounts: {
@@ -280,6 +290,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
           (c) =>
             c !== CORE_CAPABILITY &&
             c !== MAIL_CAPABILITY &&
+            !((google.labelTags ?? true) && c === KEYWORDS_CAPABILITY) &&
             !(canCompose && c === SUBMISSION_CAPABILITY),
         )
       )

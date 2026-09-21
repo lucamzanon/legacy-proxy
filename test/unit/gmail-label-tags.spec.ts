@@ -109,3 +109,41 @@ it("searches a tag as the label it is", () => {
   expect(gmailFilter({ hasKeyword: "$label:da-leggere" }, labels)).toBe('label:"Da leggere"');
   expect(gmailFilter({ hasKeyword: "$label:gone" }, labels)).toBe("in:anywhere -in:anywhere");
 });
+
+it("enumerates the account's keywords from the labels rather than the mailbox", async () => {
+  const store = open();
+  const counted = labels.map((label) =>
+    label.id === "Label_1"
+      ? { ...label, messagesTotal: 12, messagesUnread: 3, color: { backgroundColor: "#42d692" } }
+      : label.id === "STARRED"
+        ? { ...label, messagesTotal: 4, messagesUnread: 1 }
+        : label,
+  );
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile") return { ...profile, messagesTotal: 100 };
+    if (resource === "labels") return { labels: counted };
+    const found = counted.find((l) => resource === `labels/${l.id}`);
+    if (found) return found;
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as never, store);
+  const result = (await mail.methods()["Keyword/get"]!({ accountId: mail.accountId })) as {
+    totalEmails: number;
+    list: Record<string, unknown>[];
+  };
+  expect(result.totalEmails).toBe(100);
+  expect(result.list).toContainEqual({
+    id: "$label:fornitori/societa-agricola",
+    name: "Fornitori/Società Agricola",
+    color: "#42d692",
+    total: 12,
+    unread: 3,
+    isProviderLabel: true,
+    source: "provider",
+  });
+  // States Gmail keeps as labels are keywords here, counted but not tags.
+  expect(result.list).toContainEqual(
+    expect.objectContaining({ id: "$flagged", total: 4, isProviderLabel: false }),
+  );
+  expect(result.list.some((k) => k.id === "$label:inbox")).toBe(false);
+});

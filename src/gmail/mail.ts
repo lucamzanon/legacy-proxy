@@ -1333,6 +1333,90 @@ export class GmailMail {
           notFound,
         };
       },
+      /**
+       * Every keyword in the account, with its counts: what a client would
+       * otherwise have to walk the whole mailbox to learn.
+       *
+       * Gmail keeps exactly this - a label knows its own totals - so the walk
+       * is one label listing instead of thousands of messages, and the answer
+       * covers labels no recent message carries, which a walk would miss
+       * entirely. Tags come back named and coloured as Gmail has them, so a
+       * client can adopt them as they are rather than guess from an id.
+       */
+      "Keyword/get": async (a) => {
+        this.account(a);
+        if (a.ids != null && !Array.isArray(a.ids))
+          throw invalidArguments("ids must be an array of strings or null");
+        const wanted =
+          a.ids == null ? null : new Set((a.ids as unknown[]).map(String));
+        const [labels, profile] = await Promise.all([
+          this.labels(),
+          this.profile(),
+        ]);
+        const list: Record<string, unknown>[] = [];
+        const add = (
+          id: string,
+          name: string,
+          color: string | null,
+          total: number,
+          unread: number,
+          provider: boolean,
+        ) => {
+          if (wanted && !wanted.has(id)) return;
+          list.push({
+            id,
+            name,
+            color,
+            total,
+            unread,
+            isProviderLabel: provider,
+            source: "provider",
+          });
+        };
+        for (const label of labels) {
+          const keyword = this.labelTags && label.type === "user" ? labelKeyword(label.name) : null;
+          if (keyword)
+            add(
+              keyword,
+              label.name,
+              label.color?.backgroundColor ?? null,
+              label.messagesTotal ?? 0,
+              label.messagesUnread ?? 0,
+              true,
+            );
+        }
+        // The states Gmail keeps as labels of its own are keywords here, and
+        // it knows their counts as exactly as it knows a label's.
+        const state = (id: string) => labels.find((l) => l.id === id);
+        const unread = state("UNREAD");
+        const starred = state("STARRED");
+        const important = state("IMPORTANT");
+        const drafts = state("DRAFT");
+        if (unread)
+          add(
+            "$seen",
+            "$seen",
+            null,
+            Math.max(0, profile.messagesTotal - (unread.messagesTotal ?? 0)),
+            0,
+            false,
+          );
+        if (starred)
+          add("$flagged", "$flagged", null, starred.messagesTotal ?? 0, starred.messagesUnread ?? 0, false);
+        if (important)
+          add("$important", "$important", null, important.messagesTotal ?? 0, important.messagesUnread ?? 0, false);
+        if (drafts)
+          add("$draft", "$draft", null, drafts.messagesTotal ?? 0, drafts.messagesUnread ?? 0, false);
+        return {
+          accountId: this.accountId,
+          state: await this.mailboxState(),
+          totalEmails: profile.messagesTotal,
+          list,
+          notFound: wanted
+            ? [...wanted].filter((id) => !list.some((k) => k.id === id))
+            : [],
+        };
+      },
       "Thread/get": async (a) => {
         this.account(a);
         const ids = this.ids(a);

@@ -51,6 +51,7 @@ const METHOD_CAPABILITY: Record<string, string> = {
   "Email/parse": "urn:ietf:params:jmap:mail",
   "SearchSnippet/get": "urn:ietf:params:jmap:mail",
   "Thread/get": "urn:ietf:params:jmap:mail",
+  "Keyword/get": "https://bulwarkmail.com/ns/jmap/keywords",
   "Thread/changes": "urn:ietf:params:jmap:mail",
   "Identity/get": "urn:ietf:params:jmap:submission",
   "Identity/set": "urn:ietf:params:jmap:submission",
@@ -77,6 +78,7 @@ const METHOD_CAPABILITY: Record<string, string> = {
 // paid the sum of three unrelated transports' latency instead of the maximum.
 const PARALLEL_SAFE_METHODS = new Set([
   "Core/echo",
+  "Keyword/get",
   "Quota/get",
   "Mailbox/get",
   "Mailbox/query",
