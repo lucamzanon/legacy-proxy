@@ -57,6 +57,56 @@ export function labelKeyword(name: string): string | null {
     .join("/");
   return id ? LABEL_KEYWORD + id : null;
 }
+/** Named entities Gmail's snippet can carry; the numeric forms are handled by code point. */
+const SNIPPET_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+  hellip: "\u2026",
+  mdash: "\u2014",
+  ndash: "\u2013",
+  rsquo: "\u2019",
+  lsquo: "\u2018",
+  ldquo: "\u201c",
+  rdquo: "\u201d",
+};
+/**
+ * The one-line preview of a message, from Gmail's own snippet.
+ *
+ * Gmail returns the snippet **HTML-escaped** - an apostrophe arrives as
+ * `&#39;` - because it is meant to be dropped into a page. JMAP's `preview` is
+ * plain text: a client writes it into a list row or a system notification,
+ * where the escape shows through as itself. So it is decoded here, once, at
+ * the edge where Gmail's conventions stop.
+ *
+ * The same pass drops the invisible padding that bulk senders put after their
+ * preheader - runs of combining grapheme joiners, zero-width spaces and soft
+ * hyphens, meant to push the quoted body out of the inbox preview. Left in,
+ * they are what the preview mostly consists of: "See who reached out" followed
+ * by two hundred characters of nothing.
+ */
+export function snippetPreview(snippet: string | undefined): string {
+  if (!snippet) return "";
+  return snippet
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, body: string) => {
+      const ref = body.toLowerCase();
+      if (ref.startsWith("#x")) {
+        const code = Number.parseInt(ref.slice(2), 16);
+        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
+      }
+      if (ref.startsWith("#")) {
+        const code = Number.parseInt(ref.slice(1), 10);
+        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
+      }
+      return SNIPPET_ENTITIES[ref] ?? match;
+    })
+    .replace(/[\u00ad\u034f\u200b-\u200d\u2060\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 export function upstreamId(id: unknown, prefix: string): string {
   if (
     typeof id !== "string" ||
@@ -196,7 +246,7 @@ export async function mapMessage(
     replyTo: asAddresses(headers, "Reply-To"),
     subject: asText(headers, "Subject") ?? "",
     sentAt: asDate(headers, "Date"),
-    preview: message.snippet ?? "",
+    preview: snippetPreview(message.snippet),
     headers: message.payload?.headers ?? [],
     bodyStructure: root,
     ...bodies,
