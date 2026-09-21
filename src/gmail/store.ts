@@ -4,7 +4,9 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import {
   openCredentials,
+  seal,
   sealCredentials,
+  unseal,
   type Credentials,
 } from "../auth/credentials.js";
 
@@ -18,6 +20,8 @@ export interface GmailLabel {
   id: string;
   name: string;
   type: string;
+  /** Only `labels.get` reports it, and only for labels the user has coloured. */
+  color?: { textColor?: string; backgroundColor?: string };
   messagesTotal?: number;
   messagesUnread?: number;
   threadsTotal?: number;
@@ -68,7 +72,7 @@ export class GmailStore {
       CREATE INDEX IF NOT EXISTS gmail_push_sub_email ON gmail_push_sub(email);
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS gmail_cache (
-        email TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+        email TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,
         expires INTEGER NOT NULL, touched INTEGER NOT NULL, size INTEGER NOT NULL,
         PRIMARY KEY(email, key)
       );
@@ -81,6 +85,24 @@ export class GmailStore {
         updated_at INTEGER NOT NULL
       );
     `);
+    // Cached mail used to be stored as plain JSON. Those rows cannot be read
+    // back now that entries are sealed, and a cache is by definition
+    // reconstructible: drop them rather than carry a decoder for them.
+    const columns = this.db
+      .prepare("PRAGMA table_info(gmail_cache)")
+      .all() as { name: string; type: string }[];
+    if (columns.some((c) => c.name === "value" && c.type !== "BLOB")) {
+      this.db.exec(`
+        DROP TABLE gmail_cache;
+        CREATE TABLE gmail_cache (
+          email TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,
+          expires INTEGER NOT NULL, touched INTEGER NOT NULL, size INTEGER NOT NULL,
+          PRIMARY KEY(email, key)
+        );
+        CREATE INDEX gmail_cache_expires ON gmail_cache(expires);
+        CREATE INDEX gmail_cache_touched ON gmail_cache(email, touched);
+      `);
+    }
   }
   async save(
     email: string,
@@ -268,18 +290,37 @@ export class GmailStore {
       .prepare(
         "SELECT value,touched FROM gmail_cache WHERE email=? AND key=? AND expires>?",
       )
-      .get(email, key, now) as { value: string; touched: number } | undefined;
+      .get(email, key, now) as { value: Buffer; touched: number } | undefined;
     if (!row) return null;
+    let value: T;
+    try {
+      value = JSON.parse(unseal(this.vaultKey, row.value).toString("utf8")) as T;
+    } catch {
+      // A row this key cannot open is unreadable for good: drop it and let the
+      // caller fetch the data again.
+      this.db
+        .prepare("DELETE FROM gmail_cache WHERE email=? AND key=?")
+        .run(email, key);
+      return null;
+    }
     // Recency only orders eviction: refresh it at most once a minute instead of writing on every read.
     if (now - row.touched > 60_000)
       this.db
         .prepare("UPDATE gmail_cache SET touched=? WHERE email=? AND key=?")
         .run(now, email, key);
-    return JSON.parse(row.value) as T;
+    return value;
   }
+  /**
+   * Caches one entry, encrypted under the vault key.
+   *
+   * What passes through here is mail - subjects, senders, bodies - kept on
+   * disk for as long as its entry lives, which is long enough to be worth
+   * treating like the credentials next to it. AES-GCM on a few hundred bytes
+   * costs microseconds against the network round trip it saves.
+   */
   cache(email: string, key: string, data: unknown, ttl: number): void {
-    const value = JSON.stringify(data);
-    const size = Buffer.byteLength(value);
+    const value = seal(this.vaultKey, Buffer.from(JSON.stringify(data), "utf8"));
+    const size = value.length;
     if (size > 16 * 1024 * 1024) return;
     const now = Date.now();
     this.db.transaction(() => {

@@ -83,6 +83,21 @@ const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
   "headers",
 ]);
 
+/**
+ * How long a cached message may outlive its last read.
+ *
+ * Correctness does not rest on this number. Every change Gmail reports through
+ * `history.list` evicts the messages it names (see `GmailStore.checkpoint`),
+ * and a cursor too old to replay drops the account's cache wholesale, so an
+ * entry that is still here is an entry Gmail has said nothing about. What the
+ * expiry bounds is how long an untouched entry occupies the per-account
+ * budget, which is what ordinarily reclaims space instead.
+ *
+ * At the previous thirty minutes, opening the client after lunch meant reading
+ * the same page from Google again.
+ */
+const MESSAGE_TTL = 30 * 24 * 60 * 60_000;
+
 export class GmailMail {
   readonly accountId: string;
   private composer: GmailCompose;
@@ -255,6 +270,14 @@ export class GmailMail {
             changed.messages,
             changed.threads,
           );
+          // What just arrived is what the client reads next. Fetching it here,
+          // in one batch, is the difference between a notification the user
+          // opens instantly and one that waits on Google. Detached on purpose:
+          // nothing about this request depends on it.
+          void this.prefetch(
+            changed.messages.slice(0, MAX_BATCH),
+            "metadata",
+          ).catch(() => {});
         }
       } catch (e) {
         if (!(e instanceof JmapError) || e.type !== "cannotCalculateChanges")
@@ -550,7 +573,7 @@ export class GmailMail {
       for (const [index, id] of page.entries()) {
         const answer = answers[index];
         if (answer?.data)
-          this.store.cache(this.email, key(id), answer.data, 30 * 60_000);
+          this.store.cache(this.email, key(id), answer.data, MESSAGE_TTL);
       }
     }
   }
@@ -571,7 +594,7 @@ export class GmailMail {
     }
     return this.cached(
       `${format === "full" ? "message" : "meta"}:v2:${id}`,
-      30 * 60_000,
+      MESSAGE_TTL,
       () =>
         this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 5, {
           format,
@@ -735,8 +758,10 @@ export class GmailMail {
               messages?: { id: string; threadId: string }[];
               nextPageToken?: string;
             }>(
+              // Keyed by account state: a listing that survives here is one
+              // no history record has touched, so it cannot go stale.
               `page:${state}:${hash(listing)}:${hash(cursor)}`,
-              30 * 60_000,
+              MESSAGE_TTL,
               () =>
                 this.api.get("messages", 5, {
                   ...listing,
@@ -784,7 +809,7 @@ export class GmailMail {
     const gmailQuery = await q();
     const references = await this.cached<{ id: string; threadId: string }[]>(
       `query:${state}:${hash(gmailQuery)}`,
-      30 * 60_000,
+      MESSAGE_TTL,
       async () => {
         const result = new Map<string, { id: string; threadId: string }>();
         let pageToken = "";
@@ -1301,7 +1326,7 @@ export class GmailMail {
             const thread = await this.cached<{
               id: string;
               messages?: GmailMessage[];
-            }>(`thread:v2:${id}`, 30 * 60_000, () =>
+            }>(`thread:v2:${id}`, MESSAGE_TTL, () =>
               this.api.get(
                 `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
                 10,
@@ -1314,7 +1339,7 @@ export class GmailMail {
                   this.email,
                   `message:v2:${message.id}`,
                   message,
-                  30 * 60_000,
+                  MESSAGE_TTL,
                 );
             const messages = [...(thread.messages ?? [])].sort(
               (a, b) => Number(a.internalDate) - Number(b.internalDate),
