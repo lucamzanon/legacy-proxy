@@ -362,7 +362,7 @@ export class GmailCompose {
       if (candidate) {
         const original = await this.c.api.get<GmailMessage>(
           "messages/" + encodeURIComponent(candidate.id),
-          20,
+          5,
           { format: "metadata" },
         );
         const header = (name: string) =>
@@ -411,7 +411,7 @@ export class GmailCompose {
   private async checkedDraft(original: string, format = "minimal"): Promise<Draft> {
     const draft = await this.c.api.get<Draft>(
       "drafts/" + encodeURIComponent(await this.findDraft(original)),
-      20,
+      5,
       { format },
     );
     if (draft.message.id !== original || !draft.message.labelIds?.includes("DRAFT"))
@@ -426,7 +426,7 @@ export class GmailCompose {
       fail("forbidden", "Submitted drafts cannot be deleted through this operation");
     const m = await this.c.api.get<GmailMessage>(
       "messages/" + encodeURIComponent(this.c.store.upstreamId(this.c.email, original)),
-      20,
+      5,
       { format: "minimal" },
     );
     if (!m.labelIds?.includes("DRAFT")) fail("forbidden", "Permanent mail deletion is disabled");

@@ -27,6 +27,9 @@ export interface GoogleClient {
     retry: boolean;
     method?: "GET" | "POST" | "PATCH" | "DELETE";
     data?: unknown;
+    headers?: Record<string, string>;
+    /** `text` keeps a multipart batch answer intact instead of letting the transport parse it as JSON. */
+    responseType?: "text";
   }): Promise<{ data: T }>;
 }
 export type GoogleClientFactory = () => GoogleClient;

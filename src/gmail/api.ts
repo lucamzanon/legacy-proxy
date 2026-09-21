@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { GoogleClient } from "./connection.js";
 import { GmailConnection } from "./connection.js";
 import { GmailStore } from "./store.js";
@@ -6,6 +7,60 @@ import { JmapError } from "../jmap/errors.js";
 
 /** A write Google never received or explicitly refused: nothing changed upstream, so it is safe to retry. */
 export class GmailNotSent extends JmapError {}
+
+/**
+ * Quota units a second this bridge lets one account spend. Google refills a
+ * per-user budget of 250 a second, so pacing at 200 leaves room for the
+ * retries a 429 costs and for a second client on the same mailbox.
+ *
+ * Costs passed to {@link GmailApi.get} and {@link GmailApi.mutate} are Google's
+ * own prices (messages.get and messages.modify 5, threads.get 10,
+ * drafts.create 10, messages.import 25, send 100). Overcharging a request buys
+ * no safety and only delays it: `messages.get` billed at 20 units reserved
+ * 250 ms per message, so opening a 50-message folder waited 12.5 s on this
+ * pacer alone.
+ */
+const UNITS_PER_SECOND = 200;
+
+/** In-flight requests per account, high enough that the quota pacer above stays the limit rather than the socket count. */
+export const MAX_CONCURRENT = 12;
+
+/** Reads Google accepts in one batch request. */
+export const MAX_BATCH = 100;
+
+/**
+ * The sub-answers of a `multipart/mixed` batch response, keyed by the index
+ * their request carried in `Content-ID`.
+ *
+ * The transport hands back the body alone, so the boundary is read from the
+ * body's own first line rather than from the content type. Google is free to
+ * answer out of order, and does, which is why the correlation id matters.
+ */
+function parseBatch(
+  body: string,
+): Map<number, { status: number; body: string }> {
+  const answers = new Map<number, { status: number; body: string }>();
+  // Google prefixes the first boundary with a blank line.
+  const start = body.search(/--\S/);
+  const end = body.indexOf("\r\n", start);
+  const boundary = start < 0 || end < 0 ? "" : body.slice(start, end).trim();
+  if (!boundary.startsWith("--")) return answers;
+  for (const chunk of body.split(boundary)) {
+    const head = chunk.indexOf("\r\n\r\n");
+    if (head < 0) continue;
+    const id = /content-id:\s*<response-item-(\d+)>/i.exec(chunk.slice(0, head));
+    if (!id) continue;
+    const inner = chunk.slice(head + 4);
+    const status = /^HTTP\/[\d.]+ (\d{3})/.exec(inner);
+    const split = inner.indexOf("\r\n\r\n");
+    if (!status || split < 0) continue;
+    answers.set(Number(id[1]), {
+      status: Number(status[1]),
+      body: inner.slice(split + 4).trim(),
+    });
+  }
+  return answers;
+}
 
 /** Shared per-account quota/concurrency budget, including concurrent JMAP envelopes. */
 export class GmailApi {
@@ -53,19 +108,91 @@ export class GmailApi {
       throw new GmailNotSent("forbidden", "Unsupported Gmail write operation");
     return this.request<T>(resource, cost, params, method, data);
   }
+  /**
+   * Several reads in one HTTP request through Gmail's batch endpoint.
+   *
+   * Google prices each sub-request exactly as it prices the standalone call,
+   * so the quota cost is the same; what a batch saves is the round trip. Fifty
+   * `messages.get` calls opening a folder page cost fifty request/response
+   * pairs to Google (and, before this, fifty turns through a four-deep
+   * concurrency gate); batched, they cost one.
+   *
+   * Sub-requests answer independently: a message deleted between the listing
+   * and the read fails alone, with its own status, and the rest still arrive.
+   * Results are returned in the order asked for, whatever order Google
+   * answered in.
+   */
+  async batch<T>(
+    reads: { resource: string; params?: Record<string, string> }[],
+    cost: number,
+  ): Promise<{ status: number; data?: T }[]> {
+    if (!reads.length) return [];
+    if (reads.length > MAX_BATCH)
+      throw new JmapError("requestTooLarge", "Gmail batch is limited to 100 reads");
+    const boundary = "gmapbatch_" + crypto.randomBytes(16).toString("hex");
+    const parts = reads.map((read, index) => {
+      const path = new URL(
+        `https://gmail.googleapis.com/gmail/v1/users/me/${read.resource}`,
+      );
+      for (const [key, value] of Object.entries(read.params ?? {}))
+        path.searchParams.append(key, value);
+      return (
+        `--${boundary}\r\nContent-Type: application/http\r\n` +
+        `Content-ID: <item-${index}>\r\n\r\n` +
+        `GET ${path.pathname}${path.search}\r\n\r\n`
+      );
+    });
+    const body = parts.join("") + `--${boundary}--\r\n`;
+    const text = await this.request<string>(
+      "batch",
+      cost * reads.length,
+      {},
+      undefined,
+      undefined,
+      {
+        url: "https://gmail.googleapis.com/batch/gmail/v1",
+        data: body,
+        contentType: `multipart/mixed; boundary=${boundary}`,
+      },
+    );
+    const answers = parseBatch(text);
+    // Google reports a throttled batch inside the parts, with the envelope
+    // still 200: without this the caller would read a uniform refusal as a
+    // cache miss and spend the same budget again, one request per message.
+    let limited = 0;
+    for (const answer of answers.values())
+      if (answer.status === 429 || answer.status === 403) limited++;
+    if (limited === reads.length) {
+      this.blockedUntil = Math.max(this.blockedUntil, Date.now() + 1000);
+      throw new JmapError("serverUnavailable", "Google rate limit; retry later");
+    }
+    return reads.map((_, index) => {
+      const answer = answers.get(index);
+      if (!answer) return { status: 500 };
+      if (answer.status < 200 || answer.status >= 300)
+        return { status: answer.status };
+      try {
+        return { status: answer.status, data: JSON.parse(answer.body) as T };
+      } catch {
+        return { status: 500 };
+      }
+    });
+  }
   private async request<T>(
     resource: string,
     cost: number,
     params: Record<string, string | string[]>,
     method?: "POST" | "PATCH" | "DELETE",
     body?: unknown,
+    /** A ready-made POST that replaces the `resource`/`params` call, used by {@link batch}: it is a read, and shares this account's credentials, pacing and retries. */
+    prepared?: { url: string; data: string; contentType: string },
   ): Promise<T> {
     if (this.waiting.length >= 200)
       throw new (method ? GmailNotSent : JmapError)(
         "serverUnavailable",
         "Gmail request queue is full",
       );
-    if (this.active >= 4)
+    if (this.active >= MAX_CONCURRENT)
       await new Promise<void>((resolve) => this.waiting.push(resolve));
     else this.active++;
     // Set right before a write reaches the network: failures before that point never changed Gmail.
@@ -120,7 +247,7 @@ export class GmailApi {
           url.searchParams.append(key, one);
       for (let attempt = 0; ; attempt++) {
         const slot = Math.max(Date.now(), this.nextSlot);
-        this.nextSlot = slot + (cost * 1000) / 80; // 4,800 units/min, including retries.
+        this.nextSlot = slot + (cost * 1000) / UNITS_PER_SECOND;
         if (slot > Date.now())
           await new Promise((resolve) =>
             setTimeout(resolve, slot - Date.now()),
@@ -137,14 +264,28 @@ export class GmailApi {
         }
         try {
           dispatched = true;
-          const { data } = await client.request<T>({
-            url: url.href,
-            timeout: 15_000,
-            retry: false,
-            ...(method
-              ? { method, ...(body === undefined ? {} : { data: body }) }
-              : {}),
-          });
+          const { data } = await client.request<T>(
+            prepared
+              ? {
+                  url: prepared.url,
+                  // One batch carries up to a hundred reads: it may legitimately
+                  // take longer than any single one of them.
+                  timeout: 60_000,
+                  retry: false,
+                  method: "POST",
+                  data: prepared.data,
+                  headers: { "Content-Type": prepared.contentType },
+                  responseType: "text",
+                }
+              : {
+                  url: url.href,
+                  timeout: 15_000,
+                  retry: false,
+                  ...(method
+                    ? { method, ...(body === undefined ? {} : { data: body }) }
+                    : {}),
+                },
+          );
           return data;
         } catch (error) {
           const response = (

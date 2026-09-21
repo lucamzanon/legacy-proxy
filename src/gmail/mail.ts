@@ -10,7 +10,7 @@ import { GmailCompose, type SendAs } from "./compose.js";
 import { GMAIL_MODIFY } from "./config.js";
 import { emailPatch, labelInput, writableLabel } from "./write.js";
 import crypto from "node:crypto";
-import { GmailApi } from "./api.js";
+import { GmailApi, MAX_BATCH, MAX_CONCURRENT } from "./api.js";
 import { GmailStore, type GmailProfile, type GmailLabel } from "./store.js";
 import { GmailSubscriptions } from "./subscriptions.js";
 import {
@@ -95,7 +95,8 @@ export class GmailMail {
   readonly subscriptions: GmailSubscriptions;
   constructor(
     private email: string,
-    private api: Pick<GmailApi, "get"> & Partial<Pick<GmailApi, "mutate">>,
+    private api: Pick<GmailApi, "get"> &
+      Partial<Pick<GmailApi, "mutate" | "batch">>,
     private store: GmailStore,
     private writeEnabled = false,
     private composeEnabled = false,
@@ -137,7 +138,7 @@ export class GmailMail {
       try {
         const m = await this.api.get<GmailMessage>(
           `messages/${encodeURIComponent(id)}`,
-          20,
+          5,
           { format: "minimal" },
         );
         if (isDelivery(m.labelIds ?? [])) out.push(id);
@@ -355,13 +356,13 @@ export class GmailMail {
     const state = await this.state();
     return this.cached("labels:" + state, 60_000, async () => {
       const listed = await this.labelList();
-      // API gateway caps concurrency; label detail supplies exact message/thread counts.
+      // One in-flight batch per concurrency slot; label detail supplies exact message/thread counts.
       const labels: GmailLabel[] = [];
-      for (let offset = 0; offset < listed.length; offset += 4) {
+      for (let offset = 0; offset < listed.length; offset += MAX_CONCURRENT) {
         labels.push(
           ...(await Promise.all(
             listed
-              .slice(offset, offset + 4)
+              .slice(offset, offset + MAX_CONCURRENT)
               .map((label) =>
                 this.api.get<GmailLabel>(
                   `labels/${encodeURIComponent(label.id)}`,
@@ -493,6 +494,66 @@ export class GmailMail {
       },
     }));
   }
+  /**
+   * Fills the cache for `ids` with one batch read per hundred messages.
+   *
+   * `Email/get` asks for a page at a time - fifty messages for a folder view -
+   * and reading them one by one is what made opening a folder slow: each
+   * message was its own round trip to Google. Here they travel together, and
+   * the per-message path that follows finds every one of them cached.
+   *
+   * Best effort throughout: anything that fails, whole batch or single
+   * sub-request, is simply left uncached for {@link message} to fetch and
+   * report on in the usual way.
+   */
+  private async prefetch(
+    ids: string[],
+    format: "full" | "metadata",
+  ): Promise<void> {
+    if (!this.api.batch || ids.length < 2) return;
+    const key = (id: string) =>
+      `${format === "full" ? "message" : "meta"}:v2:${id}`;
+    const wanted = [
+      ...new Set(
+        ids
+          .map((id) => this.store.upstreamId(this.email, id))
+          .filter(
+            (id) =>
+              /^[A-Za-z0-9_-]{1,128}$/.test(id) &&
+              this.store.cached(this.email, key(id)) === null &&
+              // A cached full message already answers a metadata read.
+              (format === "full" ||
+                this.store.cached(this.email, `message:v2:${id}`) === null),
+          ),
+      ),
+    ];
+    for (let offset = 0; offset < wanted.length; offset += MAX_BATCH) {
+      const page = wanted.slice(offset, offset + MAX_BATCH);
+      const revision = this.store.revision(this.email);
+      let answers: { status: number; data?: GmailMessage }[];
+      try {
+        answers = await this.api.batch<GmailMessage>(
+          page.map((id) => ({
+            resource: `messages/${encodeURIComponent(id)}`,
+            params: { format },
+          })),
+          5,
+        );
+      } catch (error) {
+        // A batch Google throttled is the one failure that must not fall back
+        // to per-message reads: they would spend the same exhausted budget.
+        if (error instanceof JmapError && error.type === "serverUnavailable")
+          throw error;
+        return;
+      }
+      if (this.store.revision(this.email) !== revision) return;
+      for (const [index, id] of page.entries()) {
+        const answer = answers[index];
+        if (answer?.data)
+          this.store.cache(this.email, key(id), answer.data, 30 * 60_000);
+      }
+    }
+  }
   /** `metadata` omits bodies and parts: enough for list views, and much smaller to transfer and cache. */
   async message(
     id: string,
@@ -512,7 +573,7 @@ export class GmailMail {
       `${format === "full" ? "message" : "meta"}:v2:${id}`,
       30 * 60_000,
       () =>
-        this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 20, {
+        this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 5, {
           format,
         }),
     );
@@ -529,7 +590,7 @@ export class GmailMail {
       () =>
         this.api.get<{ data: string }>(
           `messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(part.body!.attachmentId!)}`,
-          20,
+          5,
         ),
     );
     const bytes = Buffer.from(result.data, "base64url");
@@ -550,7 +611,7 @@ export class GmailMail {
       const raw = await this.cached(`raw:${id}`, 60 * 60_000, () =>
         this.api.get<{ raw: string }>(
           `messages/${encodeURIComponent(id)}`,
-          20,
+          5,
           { format: "raw" },
         ),
       );
@@ -918,7 +979,7 @@ export class GmailMail {
           // Read current labels directly: cached metadata may predate a change in Gmail.
           const message = await this.api.get<GmailMessage>(
             `messages/${encodeURIComponent(this.store.upstreamId(this.email, upstreamId(id, "m_")))}`,
-            20,
+            5,
             { format: "minimal" },
           );
           const delta = emailPatch(message, patch, labels);
@@ -1182,10 +1243,14 @@ export class GmailMail {
         }
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
+        await this.prefetch(
+          ids.map((id) => upstreamId(id, "m_")),
+          format,
+        );
         // Keep the outstanding work bounded even for a large caller-supplied batch.
-        for (let i = 0; i < ids.length; i += 4) {
+        for (let i = 0; i < ids.length; i += MAX_CONCURRENT) {
           const batch = await Promise.all(
-            ids.slice(i, i + 4).map(async (id) => {
+            ids.slice(i, i + MAX_CONCURRENT).map(async (id) => {
               try {
                 const message = await this.message(
                   upstreamId(id, "m_"),
@@ -1239,7 +1304,7 @@ export class GmailMail {
             }>(`thread:v2:${id}`, 30 * 60_000, () =>
               this.api.get(
                 `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
-                40,
+                10,
                 { format: "full" },
               ),
             );
