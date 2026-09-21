@@ -23,6 +23,40 @@ export interface GmailMessage {
 export const ALL_MAIL = "all";
 /** Gmail labels that are states (read, starred, important) or another product (Chat), not places mail is filed. Keywords carry the states. */
 export const HIDDEN_LABELS: ReadonlySet<string> = new Set(["UNREAD", "STARRED", "IMPORTANT", "CHAT"]);
+/** The prefix clients use for a tag keyword. */
+export const LABEL_KEYWORD = "$label:";
+/**
+ * The keyword that carries one Gmail user label.
+ *
+ * A Gmail label is not a folder: a message wears several at once, and that is
+ * the part a JMAP mailbox cannot express - a client reading `mailboxIds` sees
+ * the message filed in several places, not labelled. Clients that show tags
+ * read them as `$label:<id>` keywords instead, so a label is offered both ways:
+ * as a mailbox, which is what a folder view and its filters need, and as a
+ * keyword, which is what puts the label back on the message.
+ *
+ * The id is the label's own name, so nesting survives - Gmail writes it with
+ * "/" and so do those clients. Case is dropped because keywords are
+ * case-insensitive; accents are folded and anything an IMAP flag cannot hold
+ * is removed, which is why this can return null for a name made entirely of
+ * such characters.
+ */
+export function labelKeyword(name: string): string | null {
+  const id = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .split("/")
+    .map((level) =>
+      level
+        .trim()
+        .replace(/\s+/g, "-")
+        .replace(/[^a-z0-9._-]/g, ""),
+    )
+    .filter(Boolean)
+    .join("/");
+  return id ? LABEL_KEYWORD + id : null;
+}
 export function upstreamId(id: unknown, prefix: string): string {
   if (
     typeof id !== "string" ||
@@ -88,6 +122,8 @@ export async function mapMessage(
   message: GmailMessage,
   args: Record<string, unknown>,
   getBytes: (p: GmailPart) => Promise<Buffer>,
+  /** Keyword for a user label id, or null for labels that are not carried as tags. */
+  tag: (labelId: string) => string | null = () => null,
 ): Promise<Record<string, unknown>> {
   const headers = (message.payload?.headers ?? []).map((h) => ({ name: h.name, rawValue: h.value }));
   const { root, parts } = partTree(message);
@@ -98,6 +134,10 @@ export async function mapMessage(
   if (labels.includes("STARRED")) keywords.$flagged = true;
   if (labels.includes("DRAFT")) keywords.$draft = true;
   if (labels.includes("IMPORTANT")) keywords.$important = true;
+  for (const id of labels) {
+    const keyword = tag(id);
+    if (keyword) keywords[keyword] = true;
+  }
   const bodyValues: Record<string, unknown> = {};
   const requested = args.properties as string[] | null | undefined;
   if (

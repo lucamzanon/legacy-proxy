@@ -45,6 +45,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       google.aliasesEnabled ?? false,
       google.schedule,
       !!google.push,
+      google.labelTags ?? true,
     ),
 ): void {
   const accounts = new Map<string, GmailMail>();

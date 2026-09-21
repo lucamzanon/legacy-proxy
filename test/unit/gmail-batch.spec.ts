@@ -117,6 +117,7 @@ it("Email/get fetches a page through one batch rather than one read per message"
   });
   const get = vi.fn(async (resource: string) => {
     if (resource === "profile") return { emailAddress: email, historyId: "5", messagesTotal: 12, threadsTotal: 12 };
+    if (resource === "labels") return { labels: [] };
     throw Error("Unexpected per-message read: " + resource);
   });
   const batch = vi.fn(async (reads: { resource: string }[]) =>

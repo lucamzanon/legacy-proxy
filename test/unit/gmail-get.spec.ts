@@ -40,6 +40,7 @@ it("reads list properties with the metadata format and bodies with the full form
   const formats: string[] = [];
   const get = vi.fn(async (resource: string, _cost: number, params: any = {}) => {
     if (resource === "profile") return profile;
+    if (resource === "labels") return { labels: [] };
     if (resource === "messages/a") {
       formats.push(params.format);
       return params.format === "metadata"

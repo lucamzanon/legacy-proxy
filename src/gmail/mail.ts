@@ -16,6 +16,7 @@ import { GmailSubscriptions } from "./subscriptions.js";
 import {
   ALL_MAIL,
   HIDDEN_LABELS,
+  labelKeyword,
   upstreamId,
   mapMessage,
   partTree,
@@ -118,6 +119,7 @@ export class GmailMail {
     private aliasesEnabled = false,
     private schedule?: { maxDelayedSend: number; lateTolerance: number },
     private pushEnabled = false,
+    private labelTags = true,
   ) {
     this.accountId = gmailAccountId(email);
     this.subscriptions = new GmailSubscriptions(email, store, {
@@ -397,6 +399,21 @@ export class GmailMail {
       }
       return labels;
     });
+  }
+  /**
+   * Resolves a Gmail label id to the keyword that carries it, for user labels
+   * only: system labels are folders and states, which `mapMessage` already
+   * reads. Built from the cheap label listing, which is cached per account
+   * state, so this costs nothing per message.
+   */
+  private async tags(): Promise<(labelId: string) => string | null> {
+    if (!this.labelTags) return () => null;
+    const keywords = new Map<string, string>();
+    for (const label of await this.labelList()) {
+      const keyword = label.type === "user" ? labelKeyword(label.name) : null;
+      if (keyword) keywords.set(label.id, keyword);
+    }
+    return (id) => keywords.get(id) ?? null;
   }
   private account(args: Record<string, unknown>): void {
     if (args.accountId !== this.accountId) throw accountNotFound();
@@ -954,6 +971,7 @@ export class GmailMail {
       kind === "Mailbox" || Object.keys(update).length
         ? await this.labels()
         : [];
+    const tag = await this.tags();
     for (const [id, input] of Object.entries(create)) {
       try {
         if (kind === "Email") {
@@ -1021,6 +1039,7 @@ export class GmailMail {
             { ...result, internalDate: result.internalDate ?? "0" },
             { properties: ["mailboxIds", "keywords"] },
             async () => Buffer.alloc(0),
+            tag,
           );
           updated[id] = {
             mailboxIds: mapped.mailboxIds,
@@ -1268,6 +1287,7 @@ export class GmailMail {
         }
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
+        const tag = await this.tags();
         await this.prefetch(
           ids.map((id) => upstreamId(id, "m_")),
           format,
@@ -1281,8 +1301,11 @@ export class GmailMail {
                   upstreamId(id, "m_"),
                   format,
                 );
-                const result = await mapMessage(message, a, (part) =>
-                  this.bytes(message.id, part),
+                const result = await mapMessage(
+                  message,
+                  a,
+                  (part) => this.bytes(message.id, part),
+                  tag,
                 );
                 result.id =
                   "m_" + this.store.originalId(this.email, message.id);

@@ -8,6 +8,8 @@ export interface GmailConfig {
   writeEnabled?: boolean;
   composeEnabled?: boolean;
   aliasesEnabled?: boolean;
+  /** Carry Gmail user labels as `$label:` keywords as well as mailboxes. On unless explicitly disabled. */
+  labelTags?: boolean;
   /** Delayed send queue (FUTURERELEASE). Absent = immediate sends only. */
   schedule?: { maxDelayedSend: number; lateTolerance: number };
   /**
@@ -109,6 +111,7 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
     writeEnabled: process.env.GMAIL_WRITE_ENABLED === "true",
     composeEnabled: process.env.GMAIL_COMPOSE_ENABLED === "true",
     aliasesEnabled: process.env.GMAIL_ALIASES_ENABLED === "true",
+    labelTags: process.env.GMAIL_LABEL_TAGS !== "false",
     ...(process.env.GMAIL_SCHEDULE_ENABLED === "true"
       ? {
           schedule: {

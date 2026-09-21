@@ -1,5 +1,5 @@
 import { JmapError } from "../jmap/errors.js";
-import { ALL_MAIL, type GmailMessage } from "./message.js";
+import { ALL_MAIL, LABEL_KEYWORD, labelKeyword, type GmailMessage } from "./message.js";
 import type { GmailLabel } from "./store.js";
 
 const invalid = (description: string): never => {
@@ -43,11 +43,22 @@ export function emailPatch(
     }
     set(label!.id, value);
   };
+  /** The user label a tag keyword names, if the account still has one. Keywords are case-insensitive. */
+  const tagged = (key: string) =>
+    labels.find((l) => l.type === "user" && labelKeyword(l.name) === key.toLowerCase());
   const keyword = (key: string, value: boolean) => {
     const mapped = Object.hasOwn(KEYWORDS, key) ? KEYWORDS[key] : undefined;
     if (mapped) {
       set(mapped.label, mapped.inverse ? !value : value);
       return;
+    }
+    if (key.toLowerCase().startsWith(LABEL_KEYWORD)) {
+      const label = tagged(key);
+      if (label) return set(label.id, value);
+      // Removing a tag no label answers to leaves the message as it is;
+      // adding one would have to invent a label, which Email/set may not do.
+      if (!value) return;
+      invalid("Unknown label keyword");
     }
     if (key === "$draft" && current.has("DRAFT") === value) return;
     if (!value && key !== "$draft") return; // Removing an absent custom keyword is a no-op.
@@ -74,6 +85,15 @@ export function emailPatch(
         keyword(k, true);
       }
       for (const k of Object.keys(KEYWORDS)) if (!(k in keywords)) keyword(k, false);
+      // Setting keywords wholesale without naming a single tag is how a client
+      // marks a message read or flagged, not how it strips its labels: only a
+      // patch that mentions tags is allowed to remove them.
+      const asked = new Set(Object.keys(keywords).map((k) => k.toLowerCase()));
+      if ([...asked].some((k) => k.startsWith(LABEL_KEYWORD)))
+        for (const l of labels) {
+          const k = l.type === "user" ? labelKeyword(l.name) : null;
+          if (k && !asked.has(k)) set(l.id, false);
+        }
       if (current.has("DRAFT") && !keywords.$draft) invalid("Draft status cannot be changed");
     } else if (key.startsWith("mailboxIds/") || key.startsWith("keywords/")) {
       if (value !== true && value !== null) invalid("Patch value must be true or null");

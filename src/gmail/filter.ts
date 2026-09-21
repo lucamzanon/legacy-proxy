@@ -3,7 +3,7 @@ import {
   invalidArguments,
   unsupportedFilter,
 } from "../jmap/errors.js";
-import { ALL_MAIL, upstreamId } from "./message.js";
+import { ALL_MAIL, LABEL_KEYWORD, labelKeyword, upstreamId } from "./message.js";
 import type { GmailLabel } from "./store.js";
 
 const SYSTEM: Record<string, string> = {
@@ -18,7 +18,7 @@ const SYSTEM: Record<string, string> = {
   CHAT: "is:chat",
 };
 const NOTHING = "in:anywhere -in:anywhere";
-const keyword = (value: unknown) => {
+const keyword = (value: unknown, labels: GmailLabel[]) => {
   if (value === "$seen") return "-is:unread";
   if (value === "$flagged") return "is:starred";
   if (value === "$draft") return "in:drafts";
@@ -30,6 +30,15 @@ const keyword = (value: unknown) => {
     /[\x00-\x20\x7f]/.test(value)
   )
     throw invalidArguments("Invalid keyword");
+  const tag = value.toLowerCase();
+  if (tag.startsWith(LABEL_KEYWORD)) {
+    // Tags are Gmail labels: search them as the label they are, by name, the
+    // same way a folder query for the same label reads.
+    const label = labels.find(
+      (l) => l.type === "user" && labelKeyword(l.name) === tag,
+    );
+    return label ? "label:" + phrase(label.name) : NOTHING;
+  }
   // Gmail has no arbitrary JMAP keywords: absent keywords match no messages.
   return NOTHING;
 };
@@ -102,8 +111,8 @@ export function gmailFilter(
         const clause = mailbox(id);
         clauses.push(clause ? `-(${clause})` : NOTHING);
       }
-    } else if (key === "hasKeyword") clauses.push(keyword(value));
-    else if (key === "notKeyword") clauses.push(`-(${keyword(value)})`);
+    } else if (key === "hasKeyword") clauses.push(keyword(value, labels));
+    else if (key === "notKeyword") clauses.push(`-(${keyword(value, labels)})`);
     else if (["from", "to", "cc", "bcc", "subject"].includes(key))
       clauses.push(`${key}:${phrase(value)}`);
     else if (key === "text") clauses.push(words(value));
