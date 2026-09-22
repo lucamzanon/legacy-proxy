@@ -122,9 +122,12 @@ export class GmailMail {
     private labelTags = true,
   ) {
     this.accountId = gmailAccountId(email);
-    this.subscriptions = new GmailSubscriptions(email, store, {
-      warn: () => {},
-    });
+    this.subscriptions = new GmailSubscriptions(
+      email,
+      store,
+      { warn: () => {} },
+      this.accountId,
+    );
     this.composer = new GmailCompose({
       email,
       accountId: this.accountId,
@@ -183,6 +186,44 @@ export class GmailMail {
           (this.store.cursor(this.email) ?? ""),
       delivered: this.lastDelivered.length,
     };
+  }
+  /**
+   * The messages this account has just received, as a push subscriber asked
+   * to see them (draft-ietf-jmap-emailpush).
+   *
+   * Reads through the same cache the arrival warm-up fills, so in the common
+   * case answering costs no Gmail call at all. A message that has already
+   * gone - moved to Trash, deleted from another client between the history
+   * record and this read - is left out: a notification for it would open
+   * onto nothing.
+   */
+  async deliveredEmails(
+    properties: string[],
+  ): Promise<Record<string, unknown>[]> {
+    const ids = [...this.lastDelivered];
+    if (ids.length === 0) return [];
+    const format = properties.every((p) => METADATA_PROPERTIES.has(p))
+      ? "metadata"
+      : "full";
+    await this.prefetch(ids, format).catch(() => {});
+    const tag = await this.tags();
+    const out: Record<string, unknown>[] = [];
+    for (const id of ids) {
+      try {
+        const message = await this.message(id, format);
+        const record = await mapMessage(
+          message,
+          { properties },
+          (part) => this.bytes(message.id, part),
+          tag,
+        );
+        record.id = "m_" + this.store.originalId(this.email, message.id);
+        out.push(record);
+      } catch {
+        // Gone, or never readable: not something to wake a device for.
+      }
+    }
+    return out;
   }
   /** Current per-type states for a StateChange event. `EmailDelivery` only when mail actually arrived. */
   async states(delivered = false): Promise<Record<string, string>> {

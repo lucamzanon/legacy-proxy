@@ -14,6 +14,13 @@ export const CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
  * can name and colour them here too.
  */
 export const KEYWORDS_CAPABILITY = "https://bulwarkmail.com/ns/jmap/keywords";
+/**
+ * Delivery notifications that name the mail (draft-ietf-jmap-emailpush): a
+ * subscriber registers a filter and a property list on its PushSubscription
+ * and every delivery that passes arrives as an `EmailPush` object. Without it
+ * a client is told only that *something* arrived and has to guess what.
+ */
+export const EMAIL_PUSH_CAPABILITY = "urn:ietf:params:jmap:emailpush";
 
 // Every capability the /jmap endpoint accepts in a request's `using` list
 // (RFC 8620 §3.6.1). Must cover everything buildSession can advertise —
@@ -27,6 +34,7 @@ export const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
   SIEVE_CAPABILITY,
   CONTACTS_CAPABILITY,
   KEYWORDS_CAPABILITY,
+  EMAIL_PUSH_CAPABILITY,
 ]);
 
 export function coreCapabilityProps(cfg: AppConfig) {

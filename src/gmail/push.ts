@@ -196,6 +196,9 @@ export class GmailPush {
     this.counters.notificationsSent += await mail.subscriptions.publish(
       mail.accountId,
       states,
+      // Only read if some subscriber registered an emailPush config; the
+      // messages are usually already cached by the arrival warm-up.
+      (properties) => mail.deliveredEmails(properties),
     );
   }
 

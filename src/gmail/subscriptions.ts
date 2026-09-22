@@ -2,6 +2,13 @@ import crypto from "node:crypto";
 import { JmapError } from "../jmap/errors.js";
 import type { MethodTable } from "../jmap/router.js";
 import type { GmailStore, PushSub } from "./store.js";
+import {
+  matchesFilter,
+  parseEmailPush,
+  projectEmail,
+  propertiesFor,
+  type EmailPushConfig,
+} from "./emailpush.js";
 
 const MAX_PER_ACCOUNT = 20;
 const DEFAULT_EXPIRES_MS = 90 * 24 * 60 * 60_000;
@@ -34,11 +41,20 @@ const project = (sub: PushSub) => ({
   expires: new Date(sub.expires).toISOString(),
   verified: sub.verified,
   keys: null,
+  emailPush: sub.emailPush,
 });
 
 export interface StateChange {
   "@type": "StateChange";
   changed: Record<string, Record<string, string>>;
+}
+
+/** draft-ietf-jmap-emailpush: the delivery itself, not just the fact of one. */
+export interface EmailPushObject {
+  "@type": "EmailPush";
+  accountId: string;
+  emails: Record<string, unknown>[];
+  state?: string;
 }
 
 /**
@@ -50,12 +66,14 @@ export class GmailSubscriptions {
     private readonly email: string,
     private readonly store: GmailStore,
     private readonly log: { warn(o: unknown, m: string): void },
+    /** The one account this connection serves: the only key an emailPush map may carry. */
+    private readonly accountId = "",
   ) {}
 
   private async post(
     sub: PushSub,
     body: unknown,
-    kind: "StateChange" | "PushVerification",
+    kind: "StateChange" | "PushVerification" | "EmailPush",
   ): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -100,22 +118,68 @@ export class GmailSubscriptions {
     );
   }
 
-  /** Notify verified subscribers interested in any of these types. */
+  /**
+   * Notify verified subscribers interested in any of these types.
+   *
+   * A subscriber that registered an `emailPush` config for this account is
+   * told what arrived - sender, subject, ids, whatever it asked for - and is
+   * then *not* sent the `EmailDelivery` ping for the same arrival: that ping
+   * would only send it back to guessing which message it was, and it would
+   * announce a second, different one. When the delivery does not pass that
+   * subscriber's filter - junk, by the filter our own client registers -
+   * nothing is sent at all, which is the point of having the filter.
+   *
+   * `deliveries` reads the messages that just arrived, and is called at most
+   * once, only if some subscriber is actually waiting for their contents.
+   */
   async publish(
     accountId: string,
     states: Record<string, string>,
+    deliveries?: (properties: string[]) => Promise<Record<string, unknown>[]>,
   ): Promise<number> {
     const subs = this.store.subscriptions(this.email).filter((s) => s.verified);
+    const configs = subs
+      .map((sub) => sub.emailPush?.[accountId])
+      .filter((config): config is EmailPushConfig => !!config);
+    let delivered: Record<string, unknown>[] = [];
+    if (deliveries && configs.length > 0) {
+      try {
+        delivered = await deliveries(propertiesFor(configs));
+      } catch (err) {
+        // Fall back to the plain ping: a notification that says less is
+        // better than a delivery nobody hears about.
+        this.log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          "gmail emailPush read failed",
+        );
+      }
+    }
     let sent = 0;
     for (const sub of subs) {
-      const changed =
-        sub.types === null
-          ? states
-          : Object.fromEntries(
-              Object.entries(states).filter(([type]) =>
-                sub.types!.includes(type),
-              ),
-            );
+      const config = sub.emailPush?.[accountId];
+      const told = !!config && delivered.length > 0;
+      if (config && told) {
+        const emails = delivered
+          .filter((email) => matchesFilter(config.filter, email))
+          .map((email) => projectEmail(email, config.properties));
+        if (emails.length > 0) {
+          const body: EmailPushObject = {
+            "@type": "EmailPush",
+            accountId,
+            emails,
+            ...(states.Email ? { state: states.Email } : {}),
+          };
+          await this.post(sub, body, "EmailPush");
+          sent++;
+        }
+      }
+      const changed = Object.fromEntries(
+        Object.entries(states).filter(
+          ([type]) =>
+            (sub.types === null || sub.types.includes(type)) &&
+            !(told && type === "EmailDelivery"),
+        ),
+      );
       if (!Object.keys(changed).length) continue;
       const body: StateChange = {
         "@type": "StateChange",
@@ -130,7 +194,11 @@ export class GmailSubscriptions {
   private create(input: unknown): Record<string, unknown> {
     const p = obj(input);
     for (const key of Object.keys(p)) {
-      if (!["deviceClientId", "url", "types", "expires", "keys"].includes(key))
+      if (
+        !["deviceClientId", "url", "types", "expires", "keys", "emailPush"].includes(
+          key,
+        )
+      )
         fail("invalidProperties", "Unsupported property " + key);
     }
     const url = typeof p.url === "string" ? p.url : "";
@@ -169,6 +237,7 @@ export class GmailSubscriptions {
     }
     if (this.store.subscriptions(this.email).length >= MAX_PER_ACCOUNT)
       fail("limit", "Too many push subscriptions");
+    const emailPush = parseEmailPush(p.emailPush, this.accountId);
     const sub = this.store.subscribe({
       id: "gp_" + crypto.randomBytes(16).toString("hex"),
       email: this.email,
@@ -178,6 +247,7 @@ export class GmailSubscriptions {
       expires,
       code: crypto.randomBytes(16).toString("hex"),
       createdAt: now,
+      emailPush,
     });
     this.verify(sub);
     // Server-set properties only, per §5.3: the client already knows the rest.
@@ -194,7 +264,9 @@ export class GmailSubscriptions {
       fail("notFound", "Unknown subscription");
     const p = obj(input);
     for (const key of Object.keys(p)) {
-      if (!["verificationCode", "expires", "types"].includes(key))
+      if (
+        !["verificationCode", "expires", "types", "emailPush"].includes(key)
+      )
         fail("invalidProperties", "Property cannot be updated: " + key);
     }
     if (p.verificationCode !== undefined) {
@@ -221,6 +293,11 @@ export class GmailSubscriptions {
       )
         fail("invalidProperties", "Invalid types");
       this.store.updateSubscription(id, { types: p.types as string[] | null });
+    }
+    if (p.emailPush !== undefined) {
+      this.store.updateSubscription(id, {
+        emailPush: parseEmailPush(p.emailPush, this.accountId),
+      });
     }
   }
 

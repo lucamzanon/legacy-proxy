@@ -8,6 +8,7 @@ import type {
 import type { AppConfig } from "../util/config.js";
 import {
   CORE_CAPABILITY,
+  EMAIL_PUSH_CAPABILITY,
   KEYWORDS_CAPABILITY,
   MAIL_CAPABILITY,
   SUBMISSION_CAPABILITY,
@@ -204,6 +205,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
           ...(google.labelTags ?? true
             ? { [KEYWORDS_CAPABILITY]: { supportsCounts: true } }
             : {}),
+          // Only with push on: without Pub/Sub nothing would ever arrive to
+          // report, and advertising it would be a promise we cannot keep.
+          ...(push ? { [EMAIL_PUSH_CAPABILITY]: {} } : {}),
           ...extraCaps,
         },
         accounts: {
@@ -214,6 +218,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
             accountCapabilities: {
               [MAIL_CAPABILITY]: mailProps,
               ...(google.labelTags ?? true ? { [KEYWORDS_CAPABILITY]: {} } : {}),
+              ...(push ? { [EMAIL_PUSH_CAPABILITY]: {} } : {}),
               ...extraCaps,
             },
           },
@@ -291,6 +296,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
             c !== CORE_CAPABILITY &&
             c !== MAIL_CAPABILITY &&
             !((google.labelTags ?? true) && c === KEYWORDS_CAPABILITY) &&
+            !(push && c === EMAIL_PUSH_CAPABILITY) &&
             !(canCompose && c === SUBMISSION_CAPABILITY),
         )
       )

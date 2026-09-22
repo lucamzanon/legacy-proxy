@@ -9,6 +9,7 @@ import {
   unseal,
   type Credentials,
 } from "../auth/credentials.js";
+import type { EmailPushConfig } from "./emailpush.js";
 
 export interface GmailProfile {
   emailAddress: string;
@@ -67,7 +68,7 @@ export class GmailStore {
       CREATE TABLE IF NOT EXISTS gmail_push_sub (
         id TEXT PRIMARY KEY, email TEXT NOT NULL, device TEXT, url TEXT NOT NULL, types TEXT,
         expires INTEGER NOT NULL, code TEXT, verified INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL, failures INTEGER NOT NULL DEFAULT 0
+        created_at INTEGER NOT NULL, failures INTEGER NOT NULL DEFAULT 0, email_push TEXT
       );
       CREATE INDEX IF NOT EXISTS gmail_push_sub_email ON gmail_push_sub(email);
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
@@ -88,6 +89,13 @@ export class GmailStore {
     // Cached mail used to be stored as plain JSON. Those rows cannot be read
     // back now that entries are sealed, and a cache is by definition
     // reconstructible: drop them rather than carry a decoder for them.
+    // A subscription made before emailPush existed simply has none: add the
+    // column and leave every row as it was.
+    const subColumns = this.db
+      .prepare("PRAGMA table_info(gmail_push_sub)")
+      .all() as { name: string }[];
+    if (!subColumns.some((c) => c.name === "email_push"))
+      this.db.exec("ALTER TABLE gmail_push_sub ADD COLUMN email_push TEXT");
     const columns = this.db
       .prepare("PRAGMA table_info(gmail_cache)")
       .all() as { name: string; type: string }[];
@@ -746,7 +754,7 @@ export class GmailStore {
   subscribe(row: Omit<PushSub, "verified" | "failures">): PushSub {
     this.db
       .prepare(
-        "INSERT INTO gmail_push_sub(id,email,device,url,types,expires,code,verified,created_at,failures) VALUES(?,?,?,?,?,?,?,0,?,0)",
+        "INSERT INTO gmail_push_sub(id,email,device,url,types,expires,code,verified,created_at,failures,email_push) VALUES(?,?,?,?,?,?,?,0,?,0,?)",
       )
       .run(
         row.id,
@@ -757,6 +765,7 @@ export class GmailStore {
         row.expires,
         row.code,
         row.createdAt,
+        row.emailPush ? JSON.stringify(row.emailPush) : null,
       );
     return { ...row, verified: false, failures: 0 };
   }
@@ -772,7 +781,11 @@ export class GmailStore {
   }
   updateSubscription(
     id: string,
-    patch: { expires?: number; types?: string[] | null },
+    patch: {
+      expires?: number;
+      types?: string[] | null;
+      emailPush?: Record<string, EmailPushConfig> | null;
+    },
   ): void {
     if (patch.expires !== undefined)
       this.db
@@ -782,6 +795,10 @@ export class GmailStore {
       this.db
         .prepare("UPDATE gmail_push_sub SET types=? WHERE id=?")
         .run(patch.types ? JSON.stringify(patch.types) : null, id);
+    if (patch.emailPush !== undefined)
+      this.db
+        .prepare("UPDATE gmail_push_sub SET email_push=? WHERE id=?")
+        .run(patch.emailPush ? JSON.stringify(patch.emailPush) : null, id);
   }
   unsubscribe(id: string, email: string): boolean {
     return (
@@ -857,6 +874,8 @@ export interface PushSub {
   verified: boolean;
   createdAt: number;
   failures: number;
+  /** draft-ietf-jmap-emailpush: which deliveries to push, and what to say about them. */
+  emailPush: Record<string, EmailPushConfig> | null;
 }
 interface RawSub {
   id: string;
@@ -869,6 +888,7 @@ interface RawSub {
   verified: number;
   created_at: number;
   failures: number;
+  email_push: string | null;
 }
 const fromSub = (r: RawSub): PushSub => ({
   id: r.id,
@@ -881,6 +901,7 @@ const fromSub = (r: RawSub): PushSub => ({
   verified: !!r.verified,
   createdAt: r.created_at,
   failures: r.failures,
+  emailPush: r.email_push ? JSON.parse(r.email_push) : null,
 });
 
 export interface ScheduleRow {
