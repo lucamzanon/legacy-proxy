@@ -1,0 +1,52 @@
+{
+  "id": "bridge-labels",
+  "name": "Gmail bridge labels",
+  "version": "0.1.0",
+  "author": "Luca Zanon",
+  "description": "Names and colours tags after the labels a Gmail account keeps, as reported by the legacy-proxy Gmail bridge, and optionally shows Gmail's inbox categories as tabs.",
+  "type": "hook",
+  "entrypoint": "index.js",
+  "minAppVersion": "1.13.0",
+  "permissions": [
+    "email:read",
+    "settings:read",
+    "settings:write",
+    "ui:message-list-tabs"
+  ],
+  "settingsSchema": {
+    "hideAdoptedTags": {
+      "type": "boolean",
+      "label": "Keep adopted labels out of the Tags list",
+      "description": "Every Gmail label is already a folder. Adopted tags still name and colour the label on each message.",
+      "default": true
+    },
+    "nestedNames": {
+      "type": "boolean",
+      "label": "Name nested labels by their last level",
+      "description": "Match this to the nested tags setting: on, \"Clients/Acme\" is called \"Acme\" under \"Clients\".",
+      "default": true
+    },
+    "categoryTabs": {
+      "type": "boolean",
+      "label": "Show Gmail's inbox categories as tabs",
+      "description": "Primary, Social, Promotions, Updates and Forums above the inbox of a Gmail account.",
+      "default": false
+    }
+  },
+  "locales": {
+    "en": {
+      "tab.primary": "Primary",
+      "tab.social": "Social",
+      "tab.promotions": "Promotions",
+      "tab.updates": "Updates",
+      "tab.forums": "Forums"
+    },
+    "it": {
+      "tab.primary": "Principale",
+      "tab.social": "Social",
+      "tab.promotions": "Promozioni",
+      "tab.updates": "Aggiornamenti",
+      "tab.forums": "Forum"
+    }
+  }
+}
